@@ -41,11 +41,14 @@ Typical workflow
 1. ``session_open`` (device="fpga" for a PCILeech FPGA, or a dump path).
 2. ``processes`` to find a PID (or use ``attach`` with a name).
 3. ``modules`` / ``regions`` / ``threads`` / ``callstack`` to orient.
-4. ``read`` / ``read_typed`` / ``hexdump`` for memory,
-   ``scan_aob`` / ``scan_value`` / ``scan_next`` for discovery,
+4. ``read`` (with dump=True) / ``read_typed`` / ``dump_region`` for memory,
+   ``scan_aob`` / ``scan_value`` / ``scan_next`` / ``pointer_scan`` for discovery,
    ``write`` / ``patch_list`` / ``patch_restore`` for edits (journaled).
 5. ``capture_module`` to hand a live module's bytes to the static analyser,
-   then ``disassemble`` / ``functions`` / ``xrefs_to`` / ``decompile_view``.
+   then ``disassemble`` / ``functions`` / ``xrefs_to`` / ``basic_blocks``.
+6. ``emu_create`` over a loaded image to snapshot-emulate it: ``emu_step``,
+   ``emu_run``, ``emu_watch`` and ``emu_call`` stand in for breakpoints,
+   which DMA cannot provide.
 
 Static-only workflows (PE files) can start at ``load_file``.
 
