@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "phantomscope": {
+      "type": "stdio",
+      "command": "F:\\phantomscope\\.venv\\Scripts\\phantomscope-mcp.exe",
+      "args": [],
+      "env": {}
+    }
+  }
+}

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phantomscope"
+version = "0.1.0"
+description = "DMA-powered reverse engineering toolkit: static PE analysis, live memory inspection and an MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "phantomscope" }]
+keywords = ["reverse-engineering", "dma", "memprocfs", "mcp", "windows", "debugging"]
+dependencies = [
+    "mcp>=2.0",
+    "pefile>=2023.2.7",
+    "capstone>=5.0",
+    "memprocfs>=5.9; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+emulate = ["unicorn>=2.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+phantomscope = "phantomscope.cli:main"
+phantomscope-mcp = "phantomscope.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q"
