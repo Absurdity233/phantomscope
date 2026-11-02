@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-"""End-to-end MCP smoke test: start the server over stdio and call tools."""
+"""End-to-end MCP smoke test: spawn the server over stdio and call real tools."""
 
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ PYTHON = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
 
 async def main() -> int:
     params = StdioServerParameters(
-        command=PYTHON,
+        command=sys.executable,
         args=["-m", "phantomscope.mcp_server"],
         env={**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")},
     )
@@ -26,30 +25,33 @@ async def main() -> int:
             await session.initialize()
             tools = await session.list_tools()
             print(f"{len(tools.tools)} tools exposed")
-            names = {tool.name for tool in tools.tools}
-            assert "session_open" in names and "emu_create" in names
 
-            result = await session.call_tool("session_open", {"device": "mock", "backend": "mock"})
-            payload = json.loads(result.content[0].text)
-            print("session_open ->", payload["kind"], payload["processes"], "processes")
+            async def call(name: str, **arguments):
+                result = await session.call_tool(name, arguments)
+                return json.loads(result.content[0].text)
 
-            result = await session.call_tool("attach", {"process": "demo_target"})
-            print("attach ->", json.loads(result.content[0].text)["attached"]["pid"])
+            opened = await call("session_open", device="mock", backend="mock")
+            print("session_open:", opened["kind"], opened["processes"], "processes")
 
-            result = await session.call_tool(
-                "read_typed", {"va": "0x21a00000120", "value_type": "int32"}
-            )
-            print("read_typed ->", json.loads(result.content[0].text)["value"])
+            attached = await call("attach", process="demo_target")
+            print("attach:", attached["attached"]["pid"])
 
-            result = await session.call_tool("capture_module", {"module": "demo_target.exe", "key": "live"})
-            print("capture_module ->", json.loads(result.content[0].text)["summary"]["arch"])
+            read = await call("read_typed", va=hex(0x21A_0000_0120), value_type="int32")
+            print("read_typed:", read["value"])
 
-            result = await session.call_tool("disassemble", {"key": "live", "count": 4})
-            instructions = json.loads(result.content[0].text)
-            print("disassemble ->", " | ".join(item["text"] for item in instructions))
+            hits = await call("scan_value", value="100", value_type="int32", label="hp")
+            print("scan_value:", hits["count"], "hits")
 
-            result = await session.call_tool("session_close", {})
-            print("session_close ->", json.loads(result.content[0].text))
+            captured = await call("capture_module", module="demo_target.exe", key="demo")
+            print("capture_module:", captured["summary"]["arch"], captured["summary"]["image_size"])
+
+            static = await call("disassemble", key="demo", count=4)
+            print("disassemble:", " | ".join(item["text"] for item in static))
+
+            emu = await call("emu_create", key="demo")
+            print("emu_create:", emu["entry"])
+
+            await call("session_close")
     return 0
 
 
