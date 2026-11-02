@@ -70,12 +70,25 @@ it, and emulate the entry point.
 ## Live usage
 
 ```powershell
-# A PCILeech FPGA (default device)
-phantomscope-mcp
+# first, sanity-check the device and time every stage
+.\.venv\Scripts\python.exe tools\probe_backend.py fpga
+# or against an offline dump
+.\.venv\Scripts\python.exe tools\probe_backend.py C:\dumps\win10.raw
 
-# an offline dump
-python -m phantomscope.mcp_server   # then session_open(device="C:/dumps/win10.raw")
+phantomscope-mcp
 ```
+
+`probe_backend.py` opens the device, then reports the latency of every backend
+operation (processes, modules, regions, threads, callstack, a module read,
+symbolisation, kernel modules, physical map, handles). Use it before blaming
+the toolkit when a tool call feels slow.
+
+Typical numbers on a PCILeech FPGA: the first `Vmm()` initialisation takes
+20–40 s while the device is probed and the target's process list is built;
+after that `list_processes()` is sub-second. If the target is asleep or DMA
+reads stall, MemProcFS blocks instead of returning an error — that is a device
+state problem, not a phantomscope bug, and `probe_backend.py` shows exactly
+which call is stuck.
 
 Then in an MCP client:
 
@@ -155,6 +168,17 @@ scope instead:
 claude mcp add phantomscope --scope user -- F:\phantomscope\.venv\Scripts\phantomscope-mcp.exe
 ```
 
+Or add it by hand to `mcpServers` in `~/.claude.json`:
+
+```json
+"phantomscope": {
+  "type": "stdio",
+  "command": "F:\phantomscope\.venv\Scripts\phantomscope-mcp.exe",
+  "args": [],
+  "env": {}
+}
+```
+
 ## Layout
 
 ```
@@ -178,6 +202,7 @@ src/phantomscope/
   mcp_server.py              MCP tools (57)
   cli.py                     command line front end
 tests/                       76 tests, no hardware required
+tools/probe_backend.py       live device sanity check with per-step timings
 ```
 
 ## Design notes
