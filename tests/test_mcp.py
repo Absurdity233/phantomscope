@@ -137,5 +137,48 @@ async def test_tool_registry_is_complete():
         "session_open", "processes", "modules", "read", "write", "scan_aob",
         "load_file", "capture_module", "disassemble", "xrefs_to", "rtti",
         "emu_create", "emu_step", "emu_watch",
+        "physical_info", "physical_read", "translate", "virtual_read", "walk",
+        "physical_images", "capture_image",
     ):
         assert expected in names
+
+
+def test_physical_tools_reject_a_non_physical_session():
+    mcp.session_open(device="mock", backend="mock")
+    payload = load(mcp.physical_info())
+    assert payload["error"] == "invalid_argument"
+    assert "physical" in payload["message"]
+
+
+def test_physical_session_end_to_end(tmp_path, demo_pe_bytes):
+    """Open a dump through the physical backend and analyse a discovered PE."""
+    from phantomscope.backends.demo import map_pe_file
+    from tests.test_physical import _build_dump, PE_PA
+
+    dump = _build_dump(tmp_path / "mcp.raw", map_pe_file(demo_pe_bytes))
+    opened = load(mcp.session_open(backend="physical", device=dump))
+    assert opened["kind"] == "physical"
+
+    info = load(mcp.physical_info())
+    assert info["kind"] == "physical"
+    assert info["mapped_bytes"] == 0x40_0000
+
+    assert load(mcp.physical_read(hex(PE_PA), 2, dump=False))["hex"] == "4d5a"
+
+    hits = load(mcp.physical_images())
+    assert [hit["pa"] for hit in hits] == [hex(PE_PA)]
+
+    translated = load(mcp.translate("0x7ff600001000", "0x200000"))
+    assert translated["mapped"] is True
+    assert translated["pa"] == "0x101000"
+
+    walked = load(mcp.walk("0x7ff600000000", 0x3000, "0x200000"))
+    assert walked["present"] == 3
+
+    captured = load(mcp.capture_image(hex(PE_PA), key="physmcp"))
+    assert captured["summary"]["arch"] == "x64"
+    assert captured["summary"]["entry"] == "0x7ff600001000"
+
+    instructions = load(mcp.disassemble("physmcp", "", count=3))
+    assert instructions[0]["mnemonic"] == "sub"
+    assert load(mcp.functions("physmcp"))[0]["source"] == "entry"

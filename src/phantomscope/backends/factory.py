@@ -20,8 +20,16 @@ def create_backend(
 ) -> MemoryBackend:
     """Create (but do not open) a backend.
 
-    ``kind`` is ``memprocfs`` for real DMA / dump analysis or ``mock`` for a
-    deterministic synthetic target (useful for demos and tests).
+    ``kind`` selects the acquisition model:
+
+    ``memprocfs``
+        Real DMA (PCILeech FPGA), a memory dump, ``pmem`` or a LeechAgent
+        remote — anything MemProcFS understands, with full OS-level views.
+    ``physical``
+        A raw physical image addressed directly (``device`` is a dump path,
+        optionally with ``memmap=pa,size;...``). No OS structures are assumed.
+    ``mock``
+        A deterministic synthetic target, for demos and tests.
     """
     kind = (kind or "memprocfs").lower()
     if kind in ("mock", "demo"):
@@ -41,4 +49,10 @@ def create_backend(
             forensic=forensic,
             wait_initialize=wait_initialize,
         )
-    raise InvalidArgument(f"unknown backend kind: {kind!r} (expected 'memprocfs' or 'mock')")
+    if kind in ("physical", "raw", "dump"):
+        from ..physical import PhysicalBackend
+
+        return PhysicalBackend(device=device, options=options, name=name)
+    raise InvalidArgument(
+        f"unknown backend kind: {kind!r} (expected 'memprocfs', 'physical' or 'mock')"
+    )

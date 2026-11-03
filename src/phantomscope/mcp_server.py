@@ -28,8 +28,9 @@ from .backends.factory import create_backend
 from .dynamic.engine import DynamicEngine
 from .dynamic.emulator import Emulator, emulator_available, emulator_for
 from .dynamic.session import Session, SessionManager
-from .errors import PhantomError
-from .utils import parse_address
+from .errors import InvalidArgument, PhantomError
+from .physical import PhysicalBackend
+from .utils import hexdump, parse_address
 
 SERVER_NAME = "phantomscope"
 
@@ -51,6 +52,14 @@ Typical workflow
    which DMA cannot provide.
 
 Static-only workflows (PE files) can start at ``load_file``.
+
+For a raw physical image with no operating system involved, open
+``session_open(backend="physical", device="<dump>")`` and use the physical
+tools: ``physical_info`` / ``physical_map`` / ``physical_read`` /
+``physical_write`` (addresses are physical), ``translate`` /
+``virtual_read`` / ``virtual_write`` / ``walk`` (x86-64 page-table walking
+with a CR3), ``physical_images`` (find PEs by structure alone) and
+``capture_image`` (hand a discovered PE to the static engine).
 
 Every dynamic tool needs a session; every static tool needs a loaded image
 key (``images`` lists them).
@@ -446,6 +455,162 @@ def watch(va: str, value_type: str = "uint32", pid: int | None = None,
         p = STATE.pid(pid, session)
         return _ok(dynamic.watch_values(p, [dynamic.reparse(p, str(va))], value_type,
                                        timeout=float(timeout)))
+    except Exception as exc:
+        return _fail(exc)
+
+
+# ---------------------------------------------------------------------------
+# Physical / DMA-native tools (no operating system assumed)
+# ---------------------------------------------------------------------------
+
+
+def _physical(session: str | None = None) -> PhysicalBackend:
+    backend = STATE.backend(session)
+    if not isinstance(backend, PhysicalBackend):
+        name = session or "default"
+        raise InvalidArgument(
+            f"session {name!r} uses the {backend.kind!r} backend; physical tools need "
+            "session_open(backend='physical', device='<dump path>')"
+        )
+    return backend
+
+
+@server.tool()
+def physical_info(session: str = "default") -> str:
+    """Geometry of the open physical image: segments, size, CR3, cache state."""
+    try:
+        return _ok(_physical(session).info())
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def physical_map(session: str = "default") -> str:
+    """Physical address ranges present in the image."""
+    try:
+        return _ok([r.to_dict() for r in _physical(session).physical_map()])
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def physical_read(pa: str, size: int = 64, dump: bool = True, session: str = "default") -> str:
+    """Read physical memory. Bytes outside every captured segment read as zeros."""
+    try:
+        backend = _physical(session)
+        address = parse_address(pa)
+        data = backend.read_physical(address, int(size))
+        payload: dict[str, Any] = {"pa": hex(address), "size": len(data), "hex": data.hex()}
+        if dump:
+            payload["dump"] = hexdump(data, base=address)
+        return _ok(payload)
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def physical_write(pa: str, data: str, session: str = "default") -> str:
+    """Write physical memory (hex). This changes the image file on disk."""
+    try:
+        backend = _physical(session)
+        address = parse_address(pa)
+        payload = bytes.fromhex(data.replace(" ", "").replace("0x", ""))
+        return _ok({"pa": hex(address), "written": backend.write_physical(address, payload)})
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def translate(va: str, cr3: str = "", levels: int = 4, session: str = "default") -> str:
+    """Translate a virtual address through page tables (defaults to the session CR3)."""
+    try:
+        backend = _physical(session)
+        address = parse_address(va)
+        base = parse_address(cr3) if cr3 else None
+        pa = backend.translate(address, cr3=base, levels=int(levels))
+        used = hex(base) if base else (hex(backend.cr3) if backend.cr3 else None)
+        return _ok({"va": hex(address), "pa": hex(pa) if pa is not None else None,
+                    "mapped": pa is not None, "cr3": used})
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def virtual_read(va: str, size: int = 64, cr3: str = "", levels: int = 4,
+                 strict: bool = True, dump: bool = True, session: str = "default") -> str:
+    """Read virtual memory through page tables. strict=False zero-fills holes."""
+    try:
+        backend = _physical(session)
+        address = parse_address(va)
+        base = parse_address(cr3) if cr3 else None
+        data = backend.read_virtual(address, int(size), cr3=base, levels=int(levels),
+                                    strict=bool(strict))
+        payload: dict[str, Any] = {"va": hex(address), "size": len(data), "hex": data.hex()}
+        if dump:
+            payload["dump"] = hexdump(data, base=address)
+        return _ok(payload)
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def virtual_write(va: str, data: str, cr3: str = "", levels: int = 4,
+                  session: str = "default") -> str:
+    """Write virtual memory through page tables (hex)."""
+    try:
+        backend = _physical(session)
+        address = parse_address(va)
+        base = parse_address(cr3) if cr3 else None
+        payload = bytes.fromhex(data.replace(" ", "").replace("0x", ""))
+        return _ok({"va": hex(address),
+                    "written": backend.write_virtual(address, payload, cr3=base,
+                                                     levels=int(levels))})
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def walk(va: str, size: int, cr3: str = "", levels: int = 4, step: int = 0x1000,
+         limit: int = 4096, session: str = "default") -> str:
+    """Report which pages in a virtual range are present (no OS structures used)."""
+    try:
+        backend = _physical(session)
+        base = parse_address(cr3) if cr3 else None
+        pages = backend.walk(parse_address(va), int(size), cr3=base, levels=int(levels),
+                             step=int(step), limit=int(limit))
+        return _ok({"present": len(pages), "pages": pages})
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def physical_images(limit: int = 200, refresh: bool = False, session: str = "default") -> str:
+    """Find PE images in physical memory by structure alone (no module list)."""
+    try:
+        hits = _physical(session).images(limit=int(limit), refresh=bool(refresh))
+        return _ok([hit.to_dict() for hit in hits])
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def capture_image(pa: str, key: str = "", size: int = 0, base: str = "",
+                  session: str = "default") -> str:
+    """Capture a PE found at a physical address and load it for static analysis.
+
+    The loaded image is based at the PE ``ImageBase`` unless ``base`` overrides
+    it, so reported addresses match the image's own view of itself.
+    """
+    try:
+        backend = _physical(session)
+        address = parse_address(pa)
+        payload, base_va, hit = backend.capture_image(
+            address, size=int(size) or None, base_va=parse_address(base) if base else None
+        )
+        image_key = key or f"phys_{hit.pa:x}"
+        image = STATE.static.load_capture(image_key, payload, base_va)
+        return _ok({"key": image_key, "hit": hit.to_dict(), "base": hex(base_va),
+                    "summary": image.summary()})
     except Exception as exc:
         return _fail(exc)
 

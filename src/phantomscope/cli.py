@@ -110,6 +110,53 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_physical(args: argparse.Namespace) -> int:
+    """Inspect a raw physical dump with no OS assumptions."""
+    from .physical import PhysicalBackend
+
+    backend = PhysicalBackend(
+        device=args.path,
+        options=[f"memmap={args.memmap}"] if args.memmap else None,
+        name="physical",
+    )
+    backend.open()
+    try:
+        if args.cr3:
+            backend.set_cr3(parse_address(args.cr3))
+        info = backend.info()
+        print(f"file     : {info['path']}")
+        print(f"size     : {info['file_size']:#x}  mapped {info['mapped_bytes']:#x}"
+              f"  max {info['max_address']}")
+        for segment in info["segments"]:
+            print(f"  segment  pa={segment['pa']} size={segment['size']}"
+                  f" file={segment['file_offset']}")
+        if backend.cr3:
+            print(f"cr3      : {hex(backend.cr3)}")
+
+        images = backend.images(limit=args.limit)
+        print(f"\nPE images: {len(images)} found by structure alone")
+        for hit in images:
+            print(f"  {hit.pa:#012x}  {hit.arch:<5} size={hit.size:#08x}"
+                  f" entry={hit.entry_rva:#06x} sections={hit.sections}"
+                  f" subsystem={hit.subsystem}")
+
+        if args.capture:
+            target = parse_address(args.capture)
+            payload, base_va, hit = backend.capture_image(
+                target, base_va=parse_address(args.base) if args.base else None
+            )
+            engine = StaticEngine()
+            engine.load_capture("captured", payload, base_va)
+            summary = engine.summary("captured")
+            print(f"\ncaptured : {summary['arch']} base={summary['base']}"
+                  f" entry={summary['entry']} size={summary['image_size']:#x}")
+            for insn in engine.disassemble("captured", None, count=args.count):
+                print(f"  {insn['va']:#x}  {insn['text']}")
+    finally:
+        backend.close()
+    return 0
+
+
 def cmd_mcp(_args: argparse.Namespace) -> int:
     from .mcp_server import main as mcp_main
 
@@ -202,6 +249,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("pattern")
     p.add_argument("--limit", type=int, default=200)
     p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser(
+        "physical", help="inspect a raw physical dump (no OS assumptions)"
+    )
+    p.add_argument("path")
+    p.add_argument("--memmap", default="", help="pa,size;pa,size memory map")
+    p.add_argument("--cr3", default="", help="CR3 used for virtual reads")
+    p.add_argument("--capture", default="", help="capture the PE at this physical address")
+    p.add_argument("--base", default="", help="override the load base of the capture")
+    p.add_argument("--limit", type=int, default=200)
+    p.add_argument("--count", type=int, default=8)
+    p.set_defaults(func=cmd_physical)
 
     return parser
 
