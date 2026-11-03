@@ -16,6 +16,7 @@ from ..utils import hexdump
 from .index import CodeIndex, IndexCache
 from .pe import PEImage, load_pe_from_bytes, load_pe_from_file
 from .scan import extract_strings, find_rtti, scan_image
+from .structs import globals_touched, infer_layout
 
 
 @dataclass
@@ -155,3 +156,16 @@ class StaticEngine:
         if not image.contains(va):
             out["hint"] = "address is outside the image; it may be heap, stack or another module"
         return out
+
+    # -- structure layout inference ---------------------------------------
+    def struct_layout(self, key: str, va: int, *, limit: int = 8000) -> list[dict]:
+        """Candidate struct layouts touched by the function containing ``va``."""
+        index = self.index(key)
+        start = index.function_start(va) or va
+        return [layout.to_dict() for layout in infer_layout(index, start, limit=limit)]
+
+    def globals_touched(self, key: str, va: int, *, limit: int = 2000) -> list[dict]:
+        """Module globals (RIP-relative references) used by a function."""
+        index = self.index(key)
+        start = index.function_start(va) or va
+        return [ref.to_dict() for ref in globals_touched(index, start, limit=limit)]

@@ -46,7 +46,9 @@ Typical workflow
    ``scan_aob`` / ``scan_value`` / ``scan_next`` / ``pointer_scan`` for discovery,
    ``write`` / ``patch_list`` / ``patch_restore`` for edits (journaled).
 5. ``capture_module`` to hand a live module's bytes to the static analyser,
-   then ``disassemble`` / ``functions`` / ``xrefs_to`` / ``basic_blocks``.
+   then ``disassemble`` / ``functions`` / ``xrefs_to`` / ``basic_blocks``, and
+   ``struct_layout`` / ``globals_touched`` to infer what the code expects its
+   pointers to point at.
 6. ``emu_create`` over a loaded image to snapshot-emulate it: ``emu_step``,
    ``emu_run``, ``emu_watch`` and ``emu_call`` stand in for breakpoints,
    which DMA cannot provide.
@@ -817,6 +819,30 @@ def static_address_info(key: str, va: str) -> str:
     """Resolve an address inside a loaded image."""
     try:
         return _ok(STATE.static.address_info(key, parse_address(va)))
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def struct_layout(key: str, va: str, limit: int = 8000) -> str:
+    """Infer candidate struct layouts from the memory operands a function uses.
+
+    Every ``[rcx+0x10]`` observed becomes a field hypothesis at offset 0x10,
+    sized by the access width.  Offsets are relative and the base is a *role*
+    (arg0/arg1/...) or a register, because nothing proves which object the
+    register holds.  Confirm hypotheses with ``read_typed`` against live memory.
+    """
+    try:
+        return _ok(STATE.static.struct_layout(key, parse_address(va), limit=int(limit)))
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def globals_touched(key: str, va: str, limit: int = 2000) -> str:
+    """Module globals (RIP-relative references) read or written by a function."""
+    try:
+        return _ok(STATE.static.globals_touched(key, parse_address(va), limit=int(limit)))
     except Exception as exc:
         return _fail(exc)
 

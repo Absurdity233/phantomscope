@@ -139,8 +139,39 @@ async def test_tool_registry_is_complete():
         "emu_create", "emu_step", "emu_watch",
         "physical_info", "physical_read", "translate", "virtual_read", "walk",
         "physical_images", "capture_image",
+        "struct_layout", "globals_touched",
     ):
         assert expected in names
+
+
+def test_struct_layout_tool(tmp_path):
+    from phantomscope.backends.demo import MODULE_BASE, build_struct_demo_pe
+
+    target = tmp_path / "struct.exe"
+    target.write_bytes(build_struct_demo_pe())
+    load(mcp.load_file(str(target), key="structdemo"))
+
+    layouts = load(mcp.struct_layout("structdemo", hex(MODULE_BASE + 0x1030)))
+    assert layouts[0]["role"] == "arg0"
+    assert [f["offset"] for f in layouts[0]["fields"]] == ["0x8", "0xc", "0x10", "0x14", "0x18"]
+
+    # Any address inside the function resolves to its start first.
+    same = load(mcp.struct_layout("structdemo", hex(MODULE_BASE + 0x1033)))
+    assert same == layouts
+
+    # The entry function touches only the stack and a global, so no layout.
+    assert load(mcp.struct_layout("structdemo", hex(MODULE_BASE + 0x1004))) == []
+
+
+def test_globals_touched_tool(tmp_path):
+    from phantomscope.backends.demo import MODULE_BASE, build_minimal_pe
+
+    target = tmp_path / "globals.exe"
+    target.write_bytes(build_minimal_pe())
+    load(mcp.load_file(str(target), key="globals"))
+
+    refs = load(mcp.globals_touched("globals", hex(MODULE_BASE + 0x1015)))
+    assert any(ref["target"] == hex(MODULE_BASE + 0x1080) for ref in refs)
 
 
 def test_physical_tools_reject_a_non_physical_session():

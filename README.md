@@ -180,7 +180,8 @@ than its physical address, because RVAs are relative to the load address.
 `load_file`, `capture_module`, `images`, `unload_image`, `image_summary`,
 `sections`, `imports`, `exports`, `strings`, `functions`, `function_info`,
 `disassemble`, `basic_blocks`, `xrefs_to`, `xrefs_from`, `callers`, `callees`,
-`scan_pattern`, `rtti`, `static_read`, `static_address_info`
+`scan_pattern`, `rtti`, `static_read`, `static_address_info`,
+`struct_layout`, `globals_touched`
 
 ### Emulation
 `emu_available`, `emu_create`, `emu_regs`, `emu_step`, `emu_run`, `emu_read`,
@@ -239,6 +240,7 @@ src/phantomscope/
     disasm.py                capstone wrapper, normalised instructions
     index.py                 functions, basic blocks, xrefs, call graph
     scan.py                  strings, AOB patterns, RTTI/vtables
+    structs.py               struct layout inference from memory operands
     engine.py                StaticEngine facade
   dynamic/
     engine.py                DynamicEngine: reads, patches, scans, diffs
@@ -251,7 +253,7 @@ src/phantomscope/
     backend.py               MemoryBackend over physical memory
   mcp_server.py              MCP tools (57)
   cli.py                     command line front end
-tests/                       113 tests, no hardware required
+tests/                       127 tests, no hardware required
 tools/probe_backend.py       live device sanity check with per-step timings
 tools/make_demo_dump.py      synthetic raw dump for the physical layer
 ```

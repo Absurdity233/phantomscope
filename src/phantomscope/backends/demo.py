@@ -100,6 +100,43 @@ def build_minimal_pe() -> bytes:
     return bytes(image)
 
 
+STRUCT_UPDATE_RVA = 0x1030
+
+
+def build_struct_demo_pe() -> bytes:
+    """A second synthetic module whose callee touches a struct through ``rcx``.
+
+    ``struct_update(rcx)`` reads and writes a handful of fields at fixed
+    offsets, which is exactly the pattern :mod:`phantomscope.analysis.structs`
+    turns into a candidate layout.  Keeping it in its own image means the
+    layout tests do not depend on the demo target's exact instruction stream.
+    """
+    image = bytearray(build_minimal_pe())
+    raw = 0x200  # raw offset of RVA 0x1000 in the single .text section
+
+    main = bytes.fromhex(
+        "4883ec28"      # 0x1000 sub rsp, 0x28
+        "e827000000"    # 0x1004 call 0x1030 (struct_update)
+        "4883c428"      # 0x1009 add rsp, 0x28
+        "c3"            # 0x100d ret
+    )
+    struct_update = bytes.fromhex(
+        "8b4110"        # 0x1030 mov eax, [rcx+0x10]
+        "894114"        # 0x1033 mov [rcx+0x14], eax
+        "488b5108"      # 0x1036 mov rdx, [rcx+0x8]
+        "83790c00"      # 0x103a cmp dword [rcx+0xc], 0
+        "7402"          # 0x103e je 0x1042
+        "c3"            # 0x1040 ret
+        "c3"            # 0x1041 ret (padding)
+        "8b4118"        # 0x1042 mov eax, [rcx+0x18]
+        "c3"            # 0x1045 ret
+    )
+
+    image[raw : raw + len(main)] = main
+    image[raw + 0x30 : raw + 0x30 + len(struct_update)] = struct_update
+    return bytes(image)
+
+
 def map_pe_file(data: bytes) -> bytes:
     """Convert a raw PE file image into an RVA-indexed memory image.
 
