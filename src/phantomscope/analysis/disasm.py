@@ -72,7 +72,10 @@ class Disassembler:
             return "jump", target
         if any(mnemonic.startswith(prefix) for prefix in COND_JUMP_PREFIXES):
             return "cond_jump", target
-        return "plain", target
+        # An immediate on a plain instruction is data (``sub rsp, 0x28``), not
+        # a branch destination; exposing it as ``target`` would read as an
+        # address to anything consuming this JSON.
+        return "plain", None
 
     @staticmethod
     def _direct_target(insn) -> int | None:

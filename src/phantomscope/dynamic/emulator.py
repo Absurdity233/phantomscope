@@ -206,25 +206,49 @@ class Emulator:
         rip = self.read_regs(["rip"])["rip"]
         return {"from": hex(start), "to": hex(rip), "regs": {k: hex(v) for k, v in self.read_regs().items()}}
 
-    def run_until(self, address: int, *, max_steps: int = 200_000, timeout_us: int = 0) -> dict:
-        start = self.read_regs(["rip"])["rip"]
+    def _run_with_stop(self, stop_at: int | None, *, max_steps: int,
+                       timeout_us: int = 0) -> tuple[str, bool]:
+        """Run, stopping at ``stop_at`` via a one-shot code hook.
+
+        Unicorn's own ``until`` argument is not used: it misbehaves once an
+        earlier ``emu_start`` has stopped at an address below the current one
+        (which is exactly what a return-trap call does), making the next
+        ``until`` silently ineffective.  A temporary hook is predictable.
+        """
+        hit = {"value": False}
+        handle = None
+        if stop_at is not None:
+            def hook(uc, addr, size, user):
+                hit["value"] = True
+                uc.emu_stop()
+
+            handle = self.uc.hook_add(self._uc_mod.UC_HOOK_CODE, hook,
+                                      begin=int(stop_at), end=int(stop_at))
         try:
-            self.uc.emu_start(start, int(address), timeout=max(0, int(timeout_us)),
-                              count=int(max_steps))
-            reason = "reached_target"
+            self.uc.emu_start(self.read_regs(["rip"])["rip"], 0,
+                              timeout=max(0, int(timeout_us)), count=int(max_steps))
+            reason = "reached_target" if hit["value"] else "budget_exhausted"
         except Exception as exc:  # unicorn raises UcError on unmapped fetch etc.
             reason = f"stopped: {exc}"
+        finally:
+            if handle is not None:
+                try:
+                    self.uc.hook_del(handle)
+                except Exception:
+                    pass
+        return reason, hit["value"]
+
+    def run_until(self, address: int, *, max_steps: int = 200_000, timeout_us: int = 0) -> dict:
+        start = self.read_regs(["rip"])["rip"]
+        reason, _hit = self._run_with_stop(int(address), max_steps=max_steps,
+                                           timeout_us=timeout_us)
         rip = self.read_regs(["rip"])["rip"]
         return {"from": hex(start), "to": hex(rip), "reason": reason,
                 "regs": {k: hex(v) for k, v in self.read_regs().items()}}
 
     def run(self, *, max_steps: int = MAX_STEPS) -> dict:
         start = self.read_regs(["rip"])["rip"]
-        try:
-            self.uc.emu_start(start, 0, count=int(max_steps))
-            reason = "budget_exhausted"
-        except Exception as exc:
-            reason = f"stopped: {exc}"
+        reason, _hit = self._run_with_stop(None, max_steps=max_steps)
         rip = self.read_regs(["rip"])["rip"]
         return {"from": hex(start), "to": hex(rip), "reason": reason,
                 "regs": {k: hex(v) for k, v in self.read_regs().items()}}
@@ -291,9 +315,37 @@ class Emulator:
         return list(self._hooks)
 
     # -- convenience -------------------------------------------------------
+    def _trap_page(self) -> int:
+        """A mapped, never-executed page used as the return address."""
+        candidates = (0x5EAD_0000, 0x5EAE_0000, 0x5EAF_0000, 0x5EB0_0000)
+        image_start = self.snapshot.image.base
+        image_end = image_start + self.snapshot.image.size
+        for base in candidates:
+            if image_start <= base < image_end:
+                continue
+            if any(start <= base < start + max(size, 0x1000)
+                   for start, size, _prot, _data in self.snapshot.extra_regions):
+                continue
+            return base
+        raise InvalidArgument("no free page for the emulator return trap")
+
     def call(self, address: int, args: Iterable[int] = (), *, max_steps: int = 200_000) -> dict:
-        """Set up a SysV-ish/Microsoft x64 call and run it until it returns."""
+        """Call a function and run it until it returns.
+
+        The return address points at a mapped trap page, so execution stops
+        cleanly with ``reason == "returned"`` instead of faulting on an
+        unmapped fetch.
+        """
         data = list(args)
+        trap = self._trap_page()
+        if getattr(self, "_mapped_trap", None) != trap:
+            try:
+                self.uc.mem_map(trap, 0x1000, self._uc_mod.UC_PROT_ALL)
+            except Exception:
+                pass  # already mapped (a previous call on this emulator)
+            self.uc.mem_write(trap, b"\xcc" * 0x10)
+            self._mapped_trap = trap
+
         stack_pointer = self.read_regs(["rsp"])["rsp"] - 0x20
         if self.bits == 64:
             arg_regs = ["rcx", "rdx", "r8", "r9"]
@@ -303,14 +355,20 @@ class Emulator:
             for index, value in enumerate(data[4:], start=4):
                 self.write(stack_pointer + 0x28 + (index - 4) * 8,
                            int(value).to_bytes(8, "little"))
-            self.write(stack_pointer, (self.snapshot.image.base + 0xDEAD).to_bytes(8, "little"))
+            self.write(stack_pointer, trap.to_bytes(8, "little"))
             self.write_regs(values)
         else:
             values = {"rip": int(address), "rsp": stack_pointer}
             for index, value in enumerate(data):
                 self.write(stack_pointer + 4 + index * 4, int(value).to_bytes(4, "little"))
+            self.write(stack_pointer, trap.to_bytes(4, "little"))
             self.write_regs(values)
-        result = self.run_until(0, max_steps=max_steps)
+
+        result = self.run_until(trap, max_steps=max_steps)
+        returned = int(result["to"], 16) == trap
+        if returned:
+            result["reason"] = "returned"
+            result["return_address"] = hex(trap)
         return {"retval": hex(self.read_regs(["rax"])["rax"]), **result}
 
     def dump_stack(self, length: int = 0x80) -> list[str]:

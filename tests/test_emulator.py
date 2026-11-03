@@ -46,8 +46,35 @@ def test_run_until_updates_global(demo_image):
 def test_call_returns_and_sets_state(demo_image):
     emu = emulator_for(demo_image)
     before = emu.read_u32(HEALTH_GLOBAL)
-    emu.call(UPDATE_HEALTH, max_steps=128)
+    result = emu.call(UPDATE_HEALTH, max_steps=128)
+    assert result["reason"] == "returned"
     assert emu.read_u32(HEALTH_GLOBAL) == before + 5
+
+
+def test_call_is_repeatable(demo_image):
+    emu = emulator_for(demo_image)
+    before = emu.read_u32(HEALTH_GLOBAL)
+    for _ in range(3):
+        assert emu.call(UPDATE_HEALTH, max_steps=128)["reason"] == "returned"
+    assert emu.read_u32(HEALTH_GLOBAL) == before + 15
+
+
+def test_call_then_step_then_run_until(demo_image):
+    """A previous call must not break later control-flow primitives."""
+    emu = emulator_for(demo_image)
+    assert emu.call(UPDATE_HEALTH, max_steps=128)["reason"] == "returned"
+
+    emu.write_regs({"rip": ENTRY, "rsp": 0x7FFF_0000_8000})
+    assert int(emu.step(1)["to"], 16) == MODULE_BASE + 0x1004
+
+    assert int(emu.run_until(UPDATE_HEALTH, max_steps=64)["to"], 16) == UPDATE_HEALTH
+    assert int(emu.run_until(MODULE_BASE + 0x1009, max_steps=64)["to"], 16) == MODULE_BASE + 0x1009
+
+
+def test_run_reports_budget_exhaustion(demo_image):
+    emu = emulator_for(demo_image)
+    emu.write_regs({"rip": UPDATE_HEALTH})
+    assert emu.run(max_steps=2)["reason"] == "budget_exhausted"
 
 
 def test_memory_read_write(demo_image):
