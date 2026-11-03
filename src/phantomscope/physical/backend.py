@@ -249,3 +249,51 @@ class PhysicalBackend(MemoryBackend):
 
     def resolve_symbol(self, pid: int, module: str, name: str) -> int | None:
         return None
+
+    # -- scanning ----------------------------------------------------------
+    def scan(self, pattern: str, *, limit: int = 200, start: int | None = None,
+             size: int | None = None, chunk: int = 4 * 1024 * 1024,
+             max_bytes: int = 512 * 1024 * 1024) -> list[dict]:
+        """AOB-scan physical memory, returning physical addresses.
+
+        Matches never straddle a read chunk, so the caller gets exact physical
+        addresses; wildcards (``??``) are supported.  ``max_bytes`` bounds the
+        total work so a huge dump cannot hang a session.
+        """
+        from ..analysis.scan import parse_pattern, scan_bytes
+
+        try:
+            tokens = parse_pattern(pattern)
+        except ValueError as exc:
+            raise InvalidArgument(str(exc)) from exc
+        if not tokens:
+            raise InvalidArgument(f"empty pattern: {pattern!r}")
+        image = self._require()
+        hits: list[dict] = []
+        examined = 0
+        overlap = max(0, len(tokens) - 1)
+
+        for segment in image.segments:
+            begin = segment.pa if start is None else max(segment.pa, int(start))
+            end = segment.end if size is None else min(
+                segment.end, int(start if start is not None else segment.pa) + int(size)
+            )
+            if begin >= end:
+                continue
+            # Only matches that start at or after ``floor`` are new: earlier
+            # ones were already found by the previous chunk's tail.
+            floor = begin
+            offset = begin
+            while offset < end and examined < max_bytes:
+                length = min(chunk, end - offset)
+                data = image.read(offset, length)
+                examined += length
+                for hit in scan_bytes(data, tokens, base=offset,
+                                      limit=max(1, limit - len(hits))):
+                    if hit >= floor:
+                        hits.append({"pa": hit, "hex": hex(hit)})
+                        if len(hits) >= limit:
+                            return hits
+                floor = offset + max(1, length - overlap)
+                offset = floor
+        return hits

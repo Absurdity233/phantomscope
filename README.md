@@ -140,6 +140,7 @@ phantomscope physical demo_phys.raw --capture 0x100000
 {"tool": "physical_info", "arguments": {}}
 {"tool": "physical_read", "arguments": {"pa": "0x100000", "size": 64}}
 {"tool": "physical_images", "arguments": {}}          // PEs found by structure alone
+{"tool": "physical_scan", "arguments": {"pattern": "48 83 ec 28"}}
 {"tool": "translate", "arguments": {"va": "0x7ff600001000", "cr3": "0x200000"}}
 {"tool": "virtual_read", "arguments": {"va": "0x7ff600001000", "size": 64, "cr3": "0x200000"}}
 {"tool": "walk", "arguments": {"va": "0x7ff600000000", "size": 4096, "cr3": "0x200000"}}
@@ -190,7 +191,7 @@ than its physical address, because RVAs are relative to the load address.
 ### Physical (no OS)
 `physical_info`, `physical_map`, `physical_read`, `physical_write`,
 `translate`, `virtual_read`, `virtual_write`, `walk`, `physical_images`,
-`capture_image`
+`physical_scan`, `capture_image`
 
 ## CLI
 
@@ -253,7 +254,7 @@ src/phantomscope/
     backend.py               MemoryBackend over physical memory
   mcp_server.py              MCP tools (57)
   cli.py                     command line front end
-tests/                       127 tests, no hardware required
+tests/                       132 tests, no hardware required
 tools/probe_backend.py       live device sanity check with per-step timings
 tools/make_demo_dump.py      synthetic raw dump for the physical layer
 ```

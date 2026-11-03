@@ -336,3 +336,33 @@ def test_backend_memmap_option(tmp_path, demo_pe_bytes):
         assert backend.read_physical(0x800000, 2) == b"MZ"
     finally:
         backend.close()
+
+
+# -- scanning -----------------------------------------------------------------
+def test_scan_finds_aob_in_physical_memory(backend):
+    hits = backend.scan("48 83 ec 28")
+    assert [h["pa"] for h in hits] == [PE_PA + 0x1000]
+
+
+def test_scan_supports_wildcards(backend):
+    hits = backend.scan("e8 ?? ?? ?? ?? 48 83 c4")
+    assert hits and hits[0]["pa"] == PE_PA + 0x1004
+
+
+def test_scan_reports_each_hit_once(backend):
+    """Chunked scanning must not duplicate matches that straddle a boundary."""
+    hits = backend.scan("4d 5a", limit=10, chunk=0x100)  # tiny chunks, lots of overlap
+    addresses = [h["pa"] for h in hits]
+    assert addresses == sorted(set(addresses))
+
+
+def test_scan_respects_start_and_size(backend):
+    outside = backend.scan("48 83 ec 28", start=PE_PA + 0x2000, size=0x1000)
+    assert outside == []
+    inside = backend.scan("48 83 ec 28", start=PE_PA, size=0x2000)
+    assert [h["pa"] for h in inside] == [PE_PA + 0x1000]
+
+
+def test_scan_rejects_empty_pattern(backend):
+    with pytest.raises(InvalidArgument):
+        backend.scan("")

@@ -596,6 +596,22 @@ def physical_images(limit: int = 200, refresh: bool = False, session: str = "def
 
 
 @server.tool()
+def physical_scan(pattern: str, limit: int = 200, start: str = "", size: int = 0,
+                  session: str = "default") -> str:
+    """AOB-scan physical memory (``48 8B ?? E8``). Hits are physical addresses."""
+    try:
+        hits = _physical(session).scan(
+            pattern,
+            limit=int(limit),
+            start=parse_address(start) if start else None,
+            size=int(size) or None,
+        )
+        return _ok({"count": len(hits), "hits": hits})
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
 def capture_image(pa: str, key: str = "", size: int = 0, base: str = "",
                   session: str = "default") -> str:
     """Capture a PE found at a physical address and load it for static analysis.
