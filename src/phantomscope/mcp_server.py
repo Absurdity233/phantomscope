@@ -28,7 +28,7 @@ from .backends.factory import create_backend
 from .dynamic.engine import DynamicEngine
 from .dynamic.emulator import Emulator, emulator_available, emulator_for
 from .dynamic.session import Session, SessionManager
-from .errors import InvalidArgument, PhantomError
+from .errors import InvalidArgument, NotFound, PhantomError
 from .physical import PhysicalBackend
 from .utils import hexdump, parse_address
 
@@ -41,7 +41,8 @@ Typical workflow
 ----------------
 1. ``session_open`` (device="fpga" for a PCILeech FPGA, or a dump path).
 2. ``processes`` to find a PID (or use ``attach`` with a name).
-3. ``modules`` / ``regions`` / ``threads`` / ``callstack`` to orient.
+3. ``modules`` / ``regions`` / ``threads`` / ``callstack`` to orient, and
+   ``handles`` / ``heaps`` / ``kernel_modules`` when the backend has them.
 4. ``read`` (with dump=True) / ``read_typed`` / ``dump_region`` for memory,
    ``scan_aob`` / ``scan_value`` / ``scan_next`` / ``pointer_scan`` for discovery,
    ``write`` / ``patch_list`` / ``patch_restore`` for edits (journaled).
@@ -64,16 +65,25 @@ with a CR3), ``physical_images`` (find PEs by structure alone) and
 ``capture_image`` (hand a discovered PE to the static engine).
 
 Every dynamic tool needs a session; every static tool needs a loaded image
-key (``images`` lists them).
+key (``images`` lists them).  Static images and emulators are scoped to the
+session that captured them, so pass ``session="<name>"`` when several targets
+are open; a bare key is still resolved against every engine.
 """
 
 
 class _Context:
-    """Per-process state shared by all tools."""
+    """Per-process state shared by all tools.
+
+    Every session owns its static engine, so images captured from one target
+    cannot overwrite another's.  Static-only workflows (``load_file`` on a PE
+    from disk) use a standalone engine that outlives any session.
+    """
 
     def __init__(self) -> None:
         self.manager = SessionManager()
-        self.static = StaticEngine()
+        self.standalone = StaticEngine()
+        #: Emulators over images in the standalone engine (no session open).
+        self.standalone_emulators: dict[str, Emulator] = {}
 
     def session(self, name: str | None = None) -> Session:
         return self.manager.get(name)
@@ -84,6 +94,69 @@ class _Context:
 
     def backend(self, name: str | None = None) -> MemoryBackend:
         return self.session(name).backend
+
+    def static(self, name: str | None = None) -> StaticEngine:
+        """Engine belonging to ``name`` (default session when omitted).
+
+        Falls back to the standalone engine when no session is open, which is
+        what makes ``load_file`` usable without a DMA target.
+        """
+        target = name or self.manager.default
+        if target is None:
+            return self.standalone
+        return self.manager.get(target).static
+
+    def engine_for(self, key: str) -> StaticEngine:
+        """Engine that owns ``key``; the default engine when nobody does."""
+        for _name, engine in self.static_engines():
+            if key in engine.images:
+                return engine
+        return self.static()
+
+    def emulator_map(self, session: str | None = None) -> dict[str, Emulator]:
+        """Emulators belonging to ``session``; the standalone map when none is open."""
+        target = session or self.manager.default
+        if target is None:
+            return self.standalone_emulators
+        return self.manager.get(target).emulators
+
+    def emulator_map_for(self, key: str, session: str | None = None) -> dict[str, Emulator]:
+        """Registry matching the engine that owns ``key``.
+
+        Keeps an emulator next to the image it was built from, so ``load_file``
+        without a session (standalone engine) does not leak emulators into a
+        session that happens to be the default.
+        """
+        if session:
+            return self.session(session).emulators
+        engine = self.engine_for(key)
+        if engine is self.standalone:
+            return self.standalone_emulators
+        for name, candidate in self.static_engines():
+            if candidate is engine and name:
+                return self.manager.get(name).emulators
+        return self.emulator_map(None)
+
+    def emulator_keys(self) -> list[str]:
+        """Every emulator key in play, across sessions and the standalone engine."""
+        keys = set(self.standalone_emulators)
+        for session in self.manager.all():
+            keys.update(session.emulators)
+        return sorted(keys)
+
+    def static_engines(self) -> list[tuple[str, StaticEngine]]:
+        """Default session first, then the others, then the standalone engine."""
+        sessions = self.manager.all()
+        ordered = sorted(sessions, key=lambda s: s.name != self.manager.default)
+        return [(s.name, s.static) for s in ordered] + [("", self.standalone)]
+
+    def clear_static(self) -> None:
+        """Drop every loaded image and emulator (tests and ``session_close``)."""
+        for session in self.manager.all():
+            session.static.images.clear()
+            session.emulators.clear()
+        self.standalone.images.clear()
+        self.standalone_emulators.clear()
 
     def pid(self, pid: int | None, session: str | None = None) -> int:
         if pid is not None:
@@ -106,6 +179,38 @@ def _fail(exc: Exception) -> str:
     if isinstance(exc, PhantomError):
         return json.dumps(exc.to_dict(), indent=2, ensure_ascii=False)
     return json.dumps({"error": type(exc).__name__, "message": str(exc)}, indent=2)
+
+
+def _static_for(key: str, session: str = "") -> StaticEngine:
+    """Engine holding ``key``.
+
+    An explicit ``session`` always wins.  Otherwise every engine is searched, so
+    a key captured in a named session stays reachable from a plain
+    ``disassemble(key=...)`` call.
+    """
+    if session:
+        return STATE.static(session)
+    return STATE.engine_for(key)
+
+
+def _claim_key(key: str, target: StaticEngine) -> None:
+    """Refuse to reuse an image key that another engine already owns."""
+    for name, engine in STATE.static_engines():
+        if engine is target:
+            continue
+        if key in engine.images:
+            where = f"session {name!r}" if name else "the standalone engine"
+            raise InvalidArgument(
+                f"image key {key!r} is already used in {where}; "
+                "pass a different key or close that session first"
+            )
+
+
+def _drop_emulator(key: str) -> None:
+    """Forget emulators built over an image that is being unloaded."""
+    for session in STATE.manager.all():
+        session.emulators.pop(key, None)
+    STATE.standalone_emulators.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +341,54 @@ def callstack(tid: int, pid: int | None = None, session: str = "default") -> str
     try:
         dynamic = STATE.dynamic(session)
         return _ok(dynamic.callstack(STATE.pid(pid, session), tid))
+    except Exception as exc:
+        return _fail(exc)
+
+
+# ---------------------------------------------------------------------------
+# Kernel / handle / heap tools
+# ---------------------------------------------------------------------------
+
+
+@server.tool()
+def kernel_modules(session: str = "default") -> str:
+    """Kernel modules (drivers) loaded on the target, when the backend has a kernel view."""
+    try:
+        return _ok([m.to_dict() for m in STATE.backend(session).kernel_modules()])
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def kernel_processes(session: str = "default") -> str:
+    """Processes seen by the kernel, including ones hidden from the user-mode list."""
+    try:
+        return _ok([p.to_dict() for p in STATE.backend(session).kernel_processes()])
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def handles(pid: int | None = None, filter: str = "", session: str = "default") -> str:
+    """Handles open in a process; ``filter`` matches the type or name, case-insensitively."""
+    try:
+        entries = STATE.backend(session).list_handles(STATE.pid(pid, session))
+        if filter:
+            needle = filter.lower()
+            entries = [
+                entry for entry in entries
+                if any(needle in str(value).lower() for value in entry.values())
+            ]
+        return _ok(entries)
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def heaps(pid: int | None = None, session: str = "default") -> str:
+    """Heaps of a process."""
+    try:
+        return _ok(STATE.backend(session).list_heaps(STATE.pid(pid, session)))
     except Exception as exc:
         return _fail(exc)
 
@@ -400,10 +553,10 @@ def scan_next(key: str, value: str = "", changed: bool = False,
 
 
 @server.tool()
-def scan_results(key: str, limit: int = 500) -> str:
+def scan_results(key: str, limit: int = 500, session: str = "default") -> str:
     """List the addresses currently held by a scan."""
     try:
-        return _ok(STATE.dynamic().scan_results(key, limit=limit))
+        return _ok(STATE.dynamic(session).scan_results(key, limit=limit))
     except Exception as exc:
         return _fail(exc)
 
@@ -488,9 +641,9 @@ def physical_info(session: str = "default") -> str:
 
 @server.tool()
 def physical_map(session: str = "default") -> str:
-    """Physical address ranges present in the image."""
+    """Physical address ranges: the dump's segments, or the target's RAM map."""
     try:
-        return _ok([r.to_dict() for r in _physical(session).physical_map()])
+        return _ok([r.to_dict() for r in STATE.backend(session).physical_map()])
     except Exception as exc:
         return _fail(exc)
 
@@ -626,7 +779,9 @@ def capture_image(pa: str, key: str = "", size: int = 0, base: str = "",
             address, size=int(size) or None, base_va=parse_address(base) if base else None
         )
         image_key = key or f"phys_{hit.pa:x}"
-        image = STATE.static.load_capture(image_key, payload, base_va)
+        engine = STATE.static(session)
+        _claim_key(image_key, engine)
+        image = engine.load_capture(image_key, payload, base_va)
         return _ok({"key": image_key, "hit": hit.to_dict(), "base": hex(base_va),
                     "summary": image.summary()})
     except Exception as exc:
@@ -639,12 +794,20 @@ def capture_image(pa: str, key: str = "", size: int = 0, base: str = "",
 
 
 @server.tool()
-def load_file(path: str, key: str = "", base: str = "") -> str:
-    """Load a PE file from disk for static analysis."""
+def load_file(path: str, key: str = "", base: str = "", session: str = "") -> str:
+    """Load a PE file from disk for static analysis.
+
+    Files loaded without ``session`` go into the standalone engine, so a
+    static-only workflow never depends on which DMA session happens to be open.
+    """
     try:
-        image = STATE.static.load_file(path, key=key or None,
-                                       base=parse_address(base) if base else None)
-        return _ok({"key": key or os.path.abspath(path), "summary": image.summary()})
+        engine = STATE.static(session) if session else STATE.standalone
+        image_key = key or os.path.abspath(path)
+        _claim_key(image_key, engine)
+        image = engine.load_file(
+            path, key=image_key, base=parse_address(base) if base else None
+        )
+        return _ok({"key": image_key, "summary": image.summary()})
     except Exception as exc:
         return _fail(exc)
 
@@ -659,67 +822,82 @@ def capture_module(module: str, pid: int | None = None, key: str = "",
         info = STATE.dynamic(session).resolve_module(p, module)
         data = backend.read(p, info.base, info.size)
         image_key = key or f"{p}:{info.name}"
-        image = STATE.static.load_capture(image_key, data, info.base, path=info.path)
+        engine = STATE.static(session)
+        _claim_key(image_key, engine)
+        image = engine.load_capture(image_key, data, info.base, path=info.path)
         return _ok({"key": image_key, "module": info.to_dict(), "summary": image.summary()})
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def images() -> str:
-    """List images loaded for static analysis."""
-    return _ok(STATE.static.keys())
+def images(session: str = "") -> str:
+    """List images loaded for static analysis (all engines when ``session`` is empty)."""
+    if session:
+        try:
+            return _ok(STATE.static(session).keys())
+        except Exception as exc:
+            return _fail(exc)
+    keys: list[str] = []
+    for _name, engine in STATE.static_engines():
+        for key in engine.keys():
+            if key not in keys:
+                keys.append(key)
+    return _ok(sorted(keys))
 
 
 @server.tool()
-def unload_image(key: str) -> str:
-    """Forget a loaded image."""
-    return _ok({"unloaded": STATE.static.unload(key)})
+def unload_image(key: str, session: str = "") -> str:
+    """Forget a loaded image and any emulator built over it."""
+    removed = _static_for(key, session).unload(key)
+    if removed:
+        _drop_emulator(key)
+    return _ok({"unloaded": removed})
 
 
 @server.tool()
-def image_summary(key: str) -> str:
+def image_summary(key: str, session: str = "") -> str:
     """Header/section/import/export summary of a loaded image."""
     try:
-        return _ok(STATE.static.summary(key))
+        return _ok(_static_for(key, session).summary(key))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def sections(key: str) -> str:
+def sections(key: str, session: str = "") -> str:
     """Sections of a loaded image."""
     try:
-        return _ok(STATE.static.sections(key))
+        return _ok(_static_for(key, session).sections(key))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def imports(key: str, module_filter: str = "") -> str:
+def imports(key: str, module_filter: str = "", session: str = "") -> str:
     """Imports of a loaded image (optionally filtered by module)."""
     try:
-        return _ok(STATE.static.imports(key, module=module_filter or None))
+        return _ok(_static_for(key, session).imports(key, module=module_filter or None))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def exports(key: str) -> str:
+def exports(key: str, session: str = "") -> str:
     """Exports of a loaded image."""
     try:
-        return _ok(STATE.static.exports(key))
+        return _ok(_static_for(key, session).exports(key))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
 def strings(key: str, min_length: int = 4, limit: int = 2000,
-            include_code: bool = False, contains: str = "") -> str:
+            include_code: bool = False, contains: str = "", session: str = "") -> str:
     """Extract strings; ``contains`` filters case-insensitively."""
     try:
-        data = STATE.static.strings(key, min_length=min_length, limit=limit,
-                                    include_code=include_code)
+        data = _static_for(key, session).strings(key, min_length=min_length, limit=limit,
+                                                 include_code=include_code)
         if contains:
             needle = contains.lower()
             data = [item for item in data if needle in item["text"].lower()]
@@ -729,28 +907,29 @@ def strings(key: str, min_length: int = 4, limit: int = 2000,
 
 
 @server.tool()
-def functions(key: str, offset: int = 0, limit: int = 200) -> str:
+def functions(key: str, offset: int = 0, limit: int = 200, session: str = "") -> str:
     """List discovered functions with callers counts."""
     try:
-        return _ok(STATE.static.functions(key, offset=offset, limit=limit))
+        return _ok(_static_for(key, session).functions(key, offset=offset, limit=limit))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def function_info(key: str, va: str) -> str:
+def function_info(key: str, va: str, session: str = "") -> str:
     """Function containing an address."""
     try:
-        return _ok(STATE.static.function_info(key, parse_address(va)))
+        return _ok(_static_for(key, session).function_info(key, parse_address(va)))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def disassemble(key: str, va: str = "", count: int = 40, function: bool = False) -> str:
+def disassemble(key: str, va: str = "", count: int = 40, function: bool = False,
+                session: str = "") -> str:
     """Disassemble from an address, or a whole function when function=True."""
     try:
-        return _ok(STATE.static.disassemble(
+        return _ok(_static_for(key, session).disassemble(
             key, parse_address(va) if va else None, count=int(count), function=function
         ))
     except Exception as exc:
@@ -758,89 +937,94 @@ def disassemble(key: str, va: str = "", count: int = 40, function: bool = False)
 
 
 @server.tool()
-def basic_blocks(key: str, va: str) -> str:
+def basic_blocks(key: str, va: str, session: str = "") -> str:
     """Basic blocks of the function containing an address."""
     try:
-        return _ok(STATE.static.blocks(key, parse_address(va)))
+        return _ok(_static_for(key, session).blocks(key, parse_address(va)))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def xrefs_to(key: str, va: str, limit: int = 100, include_pointers: bool = True) -> str:
+def xrefs_to(key: str, va: str, limit: int = 100, include_pointers: bool = True,
+             session: str = "") -> str:
     """Cross references *to* an address."""
     try:
-        return _ok(STATE.static.xrefs_to(key, parse_address(va), limit=limit,
-                                        include_pointers=include_pointers))
+        return _ok(_static_for(key, session).xrefs_to(
+            key, parse_address(va), limit=limit, include_pointers=include_pointers
+        ))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def xrefs_from(key: str, va: str, limit: int = 200) -> str:
+def xrefs_from(key: str, va: str, limit: int = 200, session: str = "") -> str:
     """Cross references *from* an address."""
     try:
-        return _ok(STATE.static.xrefs_from(key, parse_address(va), limit=limit))
+        return _ok(_static_for(key, session).xrefs_from(key, parse_address(va), limit=limit))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def callers(key: str, va: str) -> str:
+def callers(key: str, va: str, session: str = "") -> str:
     """Functions that call the function containing ``va``."""
     try:
-        return _ok(STATE.static.callers(key, parse_address(va)))
+        return _ok(_static_for(key, session).callers(key, parse_address(va)))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def callees(key: str, va: str) -> str:
+def callees(key: str, va: str, session: str = "") -> str:
     """Functions called by the function containing ``va``."""
     try:
-        return _ok(STATE.static.callees(key, parse_address(va)))
+        return _ok(_static_for(key, session).callees(key, parse_address(va)))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def scan_pattern(key: str, pattern: str, limit: int = 500, executable_only: bool = False) -> str:
+def scan_pattern(key: str, pattern: str, limit: int = 500, executable_only: bool = False,
+                 session: str = "") -> str:
     """Scan a static image for an AOB pattern."""
     try:
-        return _ok(STATE.static.scan(key, pattern, limit=limit, executable_only=executable_only))
+        return _ok(_static_for(key, session).scan(
+            key, pattern, limit=limit, executable_only=executable_only
+        ))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def rtti(key: str, limit: int = 200) -> str:
+def rtti(key: str, limit: int = 200, session: str = "") -> str:
     """MSVC RTTI classes and their vtables."""
     try:
-        return _ok(STATE.static.rtti(key, limit=limit))
+        return _ok(_static_for(key, session).rtti(key, limit=limit))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def static_read(key: str, va: str, size: int = 64) -> str:
+def static_read(key: str, va: str, size: int = 64, session: str = "") -> str:
     """Read bytes from a loaded image."""
     try:
-        return _ok(STATE.static.read(key, parse_address(va), int(size)))
+        return _ok(_static_for(key, session).read(key, parse_address(va), int(size)))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def static_address_info(key: str, va: str) -> str:
+def static_address_info(key: str, va: str, session: str = "") -> str:
     """Resolve an address inside a loaded image."""
     try:
-        return _ok(STATE.static.address_info(key, parse_address(va)))
+        return _ok(_static_for(key, session).address_info(key, parse_address(va)))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def struct_layout(key: str, va: str, limit: int = 8000) -> str:
+def struct_layout(key: str, va: str, limit: int = 8000, session: str = "") -> str:
     """Infer candidate struct layouts from the memory operands a function uses.
 
     Every ``[rcx+0x10]`` observed becomes a field hypothesis at offset 0x10,
@@ -849,16 +1033,20 @@ def struct_layout(key: str, va: str, limit: int = 8000) -> str:
     register holds.  Confirm hypotheses with ``read_typed`` against live memory.
     """
     try:
-        return _ok(STATE.static.struct_layout(key, parse_address(va), limit=int(limit)))
+        return _ok(_static_for(key, session).struct_layout(
+            key, parse_address(va), limit=int(limit)
+        ))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def globals_touched(key: str, va: str, limit: int = 2000) -> str:
+def globals_touched(key: str, va: str, limit: int = 2000, session: str = "") -> str:
     """Module globals (RIP-relative references) read or written by a function."""
     try:
-        return _ok(STATE.static.globals_touched(key, parse_address(va), limit=int(limit)))
+        return _ok(_static_for(key, session).globals_touched(
+            key, parse_address(va), limit=int(limit)
+        ))
     except Exception as exc:
         return _fail(exc)
 
@@ -866,8 +1054,16 @@ def globals_touched(key: str, va: str, limit: int = 2000) -> str:
 @server.tool()
 def server_info() -> str:
     """Server version and state summary."""
+    keys: list[str] = []
+    for _name, engine in STATE.static_engines():
+        for key in engine.keys():
+            if key not in keys:
+                keys.append(key)
     return _ok({"name": SERVER_NAME, "version": __version__, "sessions": STATE.manager.list(),
-                "images": STATE.static.keys(), "emulators": sorted(_EMULATORS),
+                "images": sorted(keys),
+                "session_images": {name: engine.keys()
+                                   for name, engine in STATE.static_engines() if name},
+                "emulators": STATE.emulator_keys(),
                 "emulation_available": emulator_available()})
 
 
@@ -876,15 +1072,18 @@ def server_info() -> str:
 # ---------------------------------------------------------------------------
 
 
-_EMULATORS: dict[str, Emulator] = {}
+def _emulators(session: str | None = None, key: str = "") -> dict[str, Emulator]:
+    """Emulator registry that goes with the image ``key`` (or with ``session``)."""
+    if key:
+        return STATE.emulator_map_for(key, session or None)
+    return STATE.emulator_map(session or None)
 
 
-def _emulator(image_key: str) -> Emulator:
-    emu = _EMULATORS.get(image_key)
+def _emulator(image_key: str, session: str | None = None) -> Emulator:
+    emu = _emulators(session, image_key).get(image_key)
     if emu is None:
-        raise PhantomError(
-            f"no emulator for {image_key!r}; call `emu_create` first"
-        )
+        where = f" in session {session!r}" if session else ""
+        raise NotFound(f"no emulator for {image_key!r}{where}; call `emu_create` first")
     return emu
 
 
@@ -895,27 +1094,28 @@ def emu_available() -> str:
 
 
 @server.tool()
-def emu_create(key: str, rip: str = "", rsp: str = "", stack_size: int = 0x10000) -> str:
+def emu_create(key: str, rip: str = "", rsp: str = "", stack_size: int = 0x10000,
+               session: str = "") -> str:
     """Create an emulator over a loaded image (optionally seeding rip/rsp)."""
     try:
-        image = STATE.static.get(key)
+        image = _static_for(key, session).get(key)
         regs: dict[str, int] = {}
         if rip:
             regs["rip"] = parse_address(rip)
         if rsp:
             regs["rsp"] = parse_address(rsp)
         emu = emulator_for(image, regs=regs)
-        _EMULATORS[key] = emu
+        _emulators(session, key)[key] = emu
         return _ok(emu.snapshot.state())
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def emu_regs(key: str, set: str = "") -> str:
+def emu_regs(key: str, set: str = "", session: str = "") -> str:
     """Read (or set with ``rax=0x10,rcx=5``) emulator registers."""
     try:
-        emu = _emulator(key)
+        emu = _emulator(key, session)
         if set:
             values: dict[str, int] = {}
             for pair in set.split(","):
@@ -930,19 +1130,19 @@ def emu_regs(key: str, set: str = "") -> str:
 
 
 @server.tool()
-def emu_step(key: str, count: int = 1) -> str:
+def emu_step(key: str, count: int = 1, session: str = "") -> str:
     """Single-step the emulator (count instructions)."""
     try:
-        return _ok(_emulator(key).step(int(count)))
+        return _ok(_emulator(key, session).step(int(count)))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def emu_run(key: str, until: str = "", max_steps: int = 200000) -> str:
+def emu_run(key: str, until: str = "", max_steps: int = 200000, session: str = "") -> str:
     """Run until an address (``until``) or until the step budget is exhausted."""
     try:
-        emu = _emulator(key)
+        emu = _emulator(key, session)
         if until:
             return _ok(emu.run_until(parse_address(until), max_steps=int(max_steps)))
         return _ok(emu.run(max_steps=int(max_steps)))
@@ -951,10 +1151,10 @@ def emu_run(key: str, until: str = "", max_steps: int = 200000) -> str:
 
 
 @server.tool()
-def emu_read(key: str, va: str, size: int = 16) -> str:
+def emu_read(key: str, va: str, size: int = 16, session: str = "") -> str:
     """Read emulator memory."""
     try:
-        emu = _emulator(key)
+        emu = _emulator(key, session)
         address = parse_address(va)
         data = emu.read(address, int(size))
         return _ok({"va": hex(address), "hex": data.hex(), "size": len(data)})
@@ -963,10 +1163,10 @@ def emu_read(key: str, va: str, size: int = 16) -> str:
 
 
 @server.tool()
-def emu_write(key: str, va: str, data: str) -> str:
+def emu_write(key: str, va: str, data: str, session: str = "") -> str:
     """Write emulator memory (hex)."""
     try:
-        emu = _emulator(key)
+        emu = _emulator(key, session)
         address = parse_address(va)
         emu.write(address, bytes.fromhex(data.replace(" ", "")))
         return _ok({"va": hex(address), "written": len(data.replace(" ", "")) // 2})
@@ -975,10 +1175,11 @@ def emu_write(key: str, va: str, data: str) -> str:
 
 
 @server.tool()
-def emu_watch(key: str, va: str, kind: str = "write", size: int = 8) -> str:
+def emu_watch(key: str, va: str, kind: str = "write", size: int = 8,
+              session: str = "") -> str:
     """Watch an emulator memory range for reads and/or writes."""
     try:
-        emu = _emulator(key)
+        emu = _emulator(key, session)
         address = parse_address(va)
         emu.watchpoint(address, kind=kind, size=int(size))
         return _ok({"watching": hex(address), "kind": kind, "size": size})
@@ -987,19 +1188,20 @@ def emu_watch(key: str, va: str, kind: str = "write", size: int = 8) -> str:
 
 
 @server.tool()
-def emu_events(key: str, limit: int = 200) -> str:
+def emu_events(key: str, limit: int = 200, session: str = "") -> str:
     """Accesses recorded by emulator watchpoints."""
     try:
-        return _ok(_emulator(key).watchpoints(limit=limit))
+        return _ok(_emulator(key, session).watchpoints(limit=limit))
     except Exception as exc:
         return _fail(exc)
 
 
 @server.tool()
-def emu_call(key: str, va: str, args: str = "", max_steps: int = 200000) -> str:
+def emu_call(key: str, va: str, args: str = "", max_steps: int = 200000,
+             session: str = "") -> str:
     """Call a function in the emulator (x64 Microsoft calling convention)."""
     try:
-        emu = _emulator(key)
+        emu = _emulator(key, session)
         parsed = [parse_address(piece) for piece in args.split(",") if piece.strip()]
         return _ok(emu.call(parse_address(va), parsed, max_steps=int(max_steps)))
     except Exception as exc:

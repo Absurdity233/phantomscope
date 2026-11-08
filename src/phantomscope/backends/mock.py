@@ -86,8 +86,8 @@ class MockBackend(MemoryBackend):
         self.threads: dict[int, list[ThreadInfo]] = {}
         self.frames: dict[tuple[int, int], list[StackFrame]] = {}
         self.symbols: dict[tuple[int, str, str], int] = {}
-        self.kernel_modules: list[ModuleInfo] = []
-        self.kernel_processes: list[ProcessInfo] = []
+        self._kernel_modules: list[ModuleInfo] = []
+        self._kernel_processes: list[ProcessInfo] = []
         self.phys: dict[int, bytearray] = {}
         self.handles: dict[int, list[dict]] = {}
         self.heaps: dict[int, list[dict]] = {}
@@ -182,10 +182,10 @@ class MockBackend(MemoryBackend):
         return None
 
     def kernel_modules(self) -> list[ModuleInfo]:
-        return list(self.kernel_modules)
+        return list(self._kernel_modules)
 
     def kernel_processes(self) -> list[ProcessInfo]:
-        return list(self.kernel_processes)
+        return list(self._kernel_processes)
 
     def physical_map(self) -> list[Region]:
         return [Region(base=pa, size=len(buf), protection="rw-", kind="physical") for pa, buf in self.phys.items()]

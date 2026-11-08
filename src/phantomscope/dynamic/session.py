@@ -26,6 +26,9 @@ class Session:
     dynamic: DynamicEngine | None = None
     attached_pid: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Snapshot emulators over this session's images, keyed by image key.  They
+    #: live here so closing the session releases the emulated memory with it.
+    emulators: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.dynamic is None:
@@ -134,6 +137,11 @@ class SessionManager:
     def list(self) -> list[dict]:
         with self._lock:
             return [session.info() for session in self._sessions.values()]
+
+    def all(self) -> list["Session"]:
+        """Snapshot of the open sessions (their order is registration order)."""
+        with self._lock:
+            return list(self._sessions.values())
 
     @property
     def default(self) -> str | None:

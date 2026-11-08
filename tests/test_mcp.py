@@ -15,10 +15,10 @@ from phantomscope.backends.demo import DEMO_PID, HEAP_BASE, MODULE_BASE, build_m
 @pytest.fixture(autouse=True)
 def clean_state():
     mcp.STATE.manager.reset()
-    mcp.STATE.static.images.clear()
+    mcp.STATE.clear_static()
     yield
     mcp.STATE.manager.reset()
-    mcp.STATE.static.images.clear()
+    mcp.STATE.clear_static()
 
 
 def load(payload: str) -> dict:
@@ -118,6 +118,77 @@ def test_session_close_all():
     assert load(mcp.session_list()) == []
 
 
+def test_scan_results_is_session_scoped():
+    mcp.session_open(device="mock", backend="mock", name="a")
+    mcp.session_open(device="mock", backend="mock", name="b")
+    mcp.attach(str(DEMO_PID), session="a")
+    assert load(mcp.scan_value("100", "int32", label="hp", session="a"))["count"] >= 1
+    # The scan lives in session a, so session b cannot see it.
+    assert load(mcp.scan_results("hp", session="b"))["error"] == "not_found"
+    assert load(mcp.scan_results("hp", session="a"))["count"] >= 1
+
+
+def test_static_images_are_per_session(tmp_path, demo_pe_bytes):
+    target = tmp_path / "demo.exe"
+    target.write_bytes(demo_pe_bytes)
+    mcp.session_open(device="mock", backend="mock", name="a")
+    mcp.session_open(device="mock", backend="mock", name="b")
+    mcp.attach(str(DEMO_PID), session="a")
+    mcp.attach(str(DEMO_PID), session="b")
+
+    load(mcp.capture_module("demo_target.exe", key="cap", session="a"))
+    assert load(mcp.images(session="a")) == ["cap"]
+    assert load(mcp.images(session="b")) == []
+
+    # A bare key still resolves to whichever engine owns it.
+    assert load(mcp.image_summary("cap"))["arch"] == "x64"
+
+    # Loading a file without a session lands in the standalone engine.
+    load(mcp.load_file(str(target), key="disk"))
+    assert "disk" not in load(mcp.images(session="a"))
+    assert load(mcp.images(session="b")) == []
+
+
+def test_kernel_and_handle_tools():
+    mcp.session_open(device="mock", backend="mock")
+    mcp.attach(str(DEMO_PID))
+
+    kernel = load(mcp.kernel_modules())
+    assert [m["name"] for m in kernel] == ["ntoskrnl.exe", "demo_driver.sys"]
+    assert load(mcp.kernel_processes())[0]["pid"] == DEMO_PID
+
+    all_handles = load(mcp.handles())
+    assert len(all_handles) == 2
+    files = load(mcp.handles(filter="file"))
+    assert [h["type"] for h in files] == ["File"]
+    assert load(mcp.heaps())[0]["va"] == HEAP_BASE
+
+
+def test_unload_image_drops_its_emulator():
+    mcp.session_open(device="mock", backend="mock")
+    mcp.attach(str(DEMO_PID))
+    load(mcp.capture_module("demo_target.exe", key="cap"))
+    load(mcp.emu_create(key="cap"))
+    assert load(mcp.emu_step(key="cap", count=1))["to"]
+
+    assert load(mcp.unload_image("cap"))["unloaded"] is True
+    assert load(mcp.emu_step(key="cap", count=1))["error"] == "not_found"
+
+
+def test_image_key_collision_across_sessions_is_refused(tmp_path, demo_pe_bytes):
+    target = tmp_path / "demo.exe"
+    target.write_bytes(demo_pe_bytes)
+    mcp.session_open(device="mock", backend="mock", name="a")
+    mcp.session_open(device="mock", backend="mock", name="b")
+    mcp.attach(str(DEMO_PID), session="a")
+    mcp.attach(str(DEMO_PID), session="b")
+
+    load(mcp.capture_module("demo_target.exe", key="cap", session="a"))
+    clash = load(mcp.capture_module("demo_target.exe", key="cap", session="b"))
+    assert clash["error"] == "invalid_argument"
+    assert "already used" in clash["message"]
+
+
 def test_errors_are_reported_as_json():
     payload = load(mcp.read("0x1000"))  # no session open
     assert payload["error"] in ("invalid_argument", "unavailable", "not_found")
@@ -140,6 +211,7 @@ async def test_tool_registry_is_complete():
         "physical_info", "physical_read", "translate", "virtual_read", "walk",
         "physical_images", "capture_image",
         "struct_layout", "globals_touched",
+        "kernel_modules", "kernel_processes", "handles", "heaps",
     ):
         assert expected in names
 

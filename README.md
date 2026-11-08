@@ -170,6 +170,9 @@ than its physical address, because RVAs are relative to the load address.
 `processes`, `process_info`, `modules`, `regions`, `threads`, `callstack`,
 `address_info`
 
+### Kernel / handles / heaps
+`kernel_modules`, `kernel_processes`, `handles`, `heaps`
+
 ### Memory
 `read`, `read_typed`, `write`, `patch_list`, `patch_restore`, `dump_region`
 
@@ -252,9 +255,9 @@ src/phantomscope/
     paging.py                x86-64 page-table walking
     pescan.py                PE discovery by structure alone
     backend.py               MemoryBackend over physical memory
-  mcp_server.py              MCP tools (57)
+  mcp_server.py              MCP tools (74)
   cli.py                     command line front end
-tests/                       132 tests, no hardware required
+tests/                       137 tests, no hardware required
 tools/probe_backend.py       live device sanity check with per-step timings
 tools/make_demo_dump.py      synthetic raw dump for the physical layer
 ```
@@ -272,6 +275,10 @@ tools/make_demo_dump.py      synthetic raw dump for the physical layer
 * **Honest capability reporting.** `MemoryBackend.caps` and the `Unavailable`
   error make it explicit when a backend cannot provide something (for example
   callstacks on a raw dump) instead of returning plausible-looking zeros.
+* **Per-session state.** Each session owns its static engine and emulators, so
+  two targets captured in one server cannot overwrite each other's images or
+  scans. Static-only work (`load_file` without a session) lands in a standalone
+  engine that outlives any session.
 
 ## Tests
 

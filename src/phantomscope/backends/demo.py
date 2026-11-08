@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import struct
 
-from ..models import StackFrame
+from ..models import ModuleInfo, StackFrame
 from .mock import MockBackend
 
 DEMO_PID = 4242
@@ -228,6 +228,14 @@ def populate_demo_backend(backend: MockBackend, *, module_bytes: bytes | None = 
         {"handle": 0x4, "type": "Event", "name": "demo-event"},
         {"handle": 0x8, "type": "File", "name": r"\Device\HarddiskVolume3\Games\Demo\data.pak"},
     ]
+    # A minimal kernel view so the kernel tools have something to return.
+    backend._kernel_modules = [
+        ModuleInfo(name="ntoskrnl.exe", base=0xFFFF_F800_0000_0000, size=0xB00000,
+                   path=r"\SystemRoot\System32\ntoskrnl.exe"),
+        ModuleInfo(name="demo_driver.sys", base=0xFFFF_F800_00B0_0000, size=0x20000,
+                   path=r"\SystemRoot\System32\drivers\demo_driver.sys"),
+    ]
+    backend._kernel_processes = [backend.processes[DEMO_PID]]
     backend.add_physical(0x1000, module_image[:0x2000])
     return backend
 
