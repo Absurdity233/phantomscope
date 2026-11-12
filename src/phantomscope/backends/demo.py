@@ -22,11 +22,27 @@ MODULE_BASE = 0x7FF6_0000_0000
 MODULE_SIZE = 0x4000
 HEAP_BASE = 0x000002_1A_0000_0000
 STACK_BASE = 0x000000_5C_0000_0000
+ARENA_BASE = 0x000002_1B_0000_0000
 
 PLAYER_HEALTH_OFFSET = 0x120
 PLAYER_AMMO_OFFSET = 0x124
 PLAYER_SCORE_OFFSET = 0x128
 PLAYER_NAME_OFFSET = 0x130
+
+#: A ``std::vector<Npc>``-shaped header in the heap: {begin, end, capacity}.
+VECTOR_HEADER_OFFSET = 0x180
+#: An ``Npc**`` array: qwords that point at the arena records.
+POINTER_ARRAY_OFFSET = 0x1C0
+#: A one-hop pointer, so pointer-chain resolution has something to walk.
+CHAIN_SLOT_OFFSET = 0x1E0
+CHAIN_TARGET_OFFSET = 0x1F0
+CHAIN_VALUE = 0xDEAD_BEEF
+
+#: Arena record layout: int32 id, int32 health, char name[12], qword vtable.
+ARENA_STRIDE = 0x20
+ARENA_COUNT = 4
+NPC_NAMES = (b"alpha", b"bravo", b"charlie", b"delta")
+NPC_HEALTH = (100, 80, 60, 0)
 
 
 def build_minimal_pe() -> bytes:
@@ -137,6 +153,101 @@ def build_struct_demo_pe() -> bytes:
     return bytes(image)
 
 
+def _put(image: bytearray, rva: int, data: bytes) -> None:
+    """Write bytes at an RVA of the single-section demo PE.
+
+    ``build_minimal_pe`` maps RVA 0x1000 at file offset 0x200, so this is the
+    only conversion needed; it keeps the builders free of magic offsets.
+    """
+    offset = 0x200 + (rva - 0x1000)
+    image[offset : offset + len(data)] = data
+
+
+def build_flow_demo_pe() -> bytes:
+    """A module with real control flow: a loop and an if/else with two returns.
+
+    ``sum(n)`` is the classic accumulator loop and ``pick(a)`` is the classic
+    "compare then return one of two constants", which is what the pseudo-C
+    structurer is tested against.
+    """
+    image = bytearray(build_minimal_pe())
+    # Entry point stays at `_main`, which now calls both new functions.
+    struct.pack_into("<I", image, 0x58 + 16, 0x1040)
+
+    # 0x1000 sum(int n in ecx)
+    _put(image, 0x1000, bytes.fromhex(
+        "31c0"            # xor eax, eax
+        "85c9"            # test ecx, ecx
+        "7e06"            # jle 0x100c
+        "01c8"            # add eax, ecx
+        "ffc9"            # dec ecx
+        "75fa"            # jnz 0x1006
+        "c3"              # ret
+    ))
+
+    # 0x1020 pick(int a in ecx)
+    _put(image, 0x1020, bytes.fromhex(
+        "83f905"          # cmp ecx, 5
+        "7e06"            # jle 0x102b
+        "b864000000"      # mov eax, 100
+        "c3"              # ret
+        "b807000000"      # mov eax, 7
+        "c3"              # ret
+    ))
+
+    # 0x1040 _main
+    _put(image, 0x1040, bytes.fromhex(
+        "4883ec28"        # sub rsp, 0x28
+        "b905000000"      # mov ecx, 5
+        "e8b2ffffff"      # call 0x1000
+        "e8cdffffff"      # call 0x1020
+        "4883c428"        # add rsp, 0x28
+        "c3"              # ret
+    ))
+    return bytes(image)
+
+
+def build_api_demo_pe() -> bytes:
+    """A module with a real import table (``KERNEL32!Sleep``, ``GetTickCount``).
+
+    The entry point calls both imports through their IAT slots and loads a string
+    literal, which is what the API-resolution, string-xref and import-stub tests
+    need.  The imported names never resolve: nothing here is executed for real.
+    """
+    image = bytearray(build_minimal_pe())
+
+    # 0x1000 _main: Sleep(10); then GetTickCount() with a string argument.
+    _put(image, 0x1000, bytes.fromhex(
+        "4883ec28"        # 0x1000 sub rsp, 0x28
+        "b90a000000"      # 0x1004 mov ecx, 10
+        "ff1521000000"    # 0x1009 call qword [rip+0x21] -> 0x1030 (Sleep)
+        "488d0d8a000000"  # 0x100f lea rcx, [rip+0x8a]  -> 0x10a0 (string)
+        "ff151c000000"    # 0x1016 call qword [rip+0x1c] -> 0x1038 (GetTickCount)
+        "4883c428"        # 0x101c add rsp, 0x28
+        "c3"              # 0x1020 ret
+    ))
+
+    # IAT (0x1030) and import lookup table (0x1048) share the hint/name pointers.
+    for slot, target in ((0x1030, 0x1070), (0x1038, 0x1078),
+                         (0x1048, 0x1070), (0x1050, 0x1078)):
+        struct.pack_into("<Q", image, 0x200 + (slot - 0x1000), target)
+    struct.pack_into("<Q", image, 0x200 + (0x1040 - 0x1000), 0)
+    struct.pack_into("<Q", image, 0x200 + (0x1058 - 0x1000), 0)
+
+    _put(image, 0x1070, b"\x00\x00Sleep\x00")             # 0x1070..0x1077
+    _put(image, 0x1078, b"\x00\x00GetTickCount\x00")      # 0x1078..0x1086
+    _put(image, 0x1088, b"KERNEL32.dll\x00")              # 0x1088..0x1094
+    _put(image, 0x10A0, b"demo-secret-key\x00")           # string literal
+
+    # IMAGE_IMPORT_DESCRIPTOR at 0x10b0, one entry plus the null terminator.
+    struct.pack_into("<IIIII", image, 0x200 + (0x10B0 - 0x1000),
+                     0x1048, 0, 0, 0x1088, 0x1030)
+    struct.pack_into("<IIIII", image, 0x200 + (0x10B0 - 0x1000) + 20, 0, 0, 0, 0, 0)
+    # DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = (rva, size)
+    struct.pack_into("<II", image, 0x58 + 112 + 8, 0x10B0, 0x28)
+    return bytes(image)
+
+
 def map_pe_file(data: bytes) -> bytes:
     """Convert a raw PE file image into an RVA-indexed memory image.
 
@@ -194,6 +305,27 @@ def populate_demo_backend(backend: MockBackend, *, module_bytes: bytes | None = 
     struct.pack_into("<i", heap, PLAYER_SCORE_OFFSET, 1337)
     heap[PLAYER_NAME_OFFSET : PLAYER_NAME_OFFSET + 8] = b"PLAYER01"
     struct.pack_into("<Q", heap, 0x100, MODULE_BASE + 0x1000)  # a vtable-ish pointer
+
+    # An arena of small records plus the container shapes that point into it, so
+    # container detection, array reads and layout inference have real data.
+    arena = bytearray(ARENA_STRIDE * ARENA_COUNT)
+    for index in range(ARENA_COUNT):
+        base = index * ARENA_STRIDE
+        struct.pack_into("<i", arena, base + 0x00, index + 1)
+        struct.pack_into("<i", arena, base + 0x04, NPC_HEALTH[index])
+        arena[base + 0x08 : base + 0x08 + 8] = NPC_NAMES[index].ljust(8, b"\x00")
+        struct.pack_into("<Q", arena, base + 0x18, MODULE_BASE + 0x1000)
+    backend.add_region(DEMO_PID, ARENA_BASE, bytes(arena), protection="rw-", tag="arena")
+
+    struct.pack_into("<Q", heap, VECTOR_HEADER_OFFSET, ARENA_BASE)
+    struct.pack_into("<Q", heap, VECTOR_HEADER_OFFSET + 8, ARENA_BASE + len(arena))
+    struct.pack_into("<Q", heap, VECTOR_HEADER_OFFSET + 16, ARENA_BASE + len(arena))
+    for index in range(ARENA_COUNT):
+        struct.pack_into("<Q", heap, POINTER_ARRAY_OFFSET + index * 8,
+                         ARENA_BASE + index * ARENA_STRIDE)
+    struct.pack_into("<Q", heap, CHAIN_SLOT_OFFSET, HEAP_BASE + CHAIN_TARGET_OFFSET)
+    struct.pack_into("<I", heap, CHAIN_TARGET_OFFSET + 8, CHAIN_VALUE)
+
     backend.add_region(DEMO_PID, HEAP_BASE, bytes(heap), protection="rw-", tag="heap")
 
     stack = bytearray(0x2000)

@@ -1,4 +1,4 @@
-"""Backend construction helpers."""
+﻿"""Backend construction helpers."""
 
 from __future__ import annotations
 
@@ -30,6 +30,10 @@ def create_backend(
         optionally with ``memmap=pa,size;...``). No OS structures are assumed.
     ``mock``
         A deterministic synthetic target, for demos and tests.
+    ``game``
+        The synthetic shooter: same idea, but with a background tick that
+        damages the local player and drifts the entities, so the motion-dependent
+        workflows (scan narrowing, change tracing) have something to fight against.
     """
     kind = (kind or "memprocfs").lower()
     if kind in ("mock", "demo"):
@@ -38,6 +42,14 @@ def create_backend(
 
         backend = MockBackend(name=name)
         populate_demo_backend(backend)
+        return backend
+    if kind in ("game", "shooter"):
+        # A synthetic game client with a running tick: the target to use when the
+        # thing being exercised is motion (scan narrowing, change tracing, pointer
+        # chains that have to survive a restart), not just reading.
+        from .gametarget import build_game_backend
+
+        backend, _state = build_game_backend(with_tick=True, name=name)
         return backend
     if kind in ("memprocfs", "dma", "fpga"):
         from .memprocfs_backend import MemProcFsBackend

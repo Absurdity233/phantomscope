@@ -32,6 +32,13 @@ FLAGSX64 = ("eflags",)
 
 MAX_STEPS = 5_000_000
 
+#: Unicorn access codes → words, so a fault reads as "unmapped write at 0x1234".
+_ACCESS_NAMES = {
+    16: "read", 17: "write", 18: "fetch",
+    19: "read_unmapped", 20: "write_unmapped", 21: "fetch_unmapped",
+    22: "write_protected",
+}
+
 
 def _unicorn():
     try:
@@ -117,9 +124,21 @@ class Emulator:
         self._reg_ids = _register_ids(uc_mod)
         self._watchpoints: list[dict] = []
         self._hooks: list[dict] = []
+        self._import_calls: list[dict] = []
+        self._faults: list[dict] = []
+        self._closed = False
+        self._stub_slots: dict[int, dict] = {}
+        self._stub_hook = None
         self._last_rip: int | None = None
         self._finished = False
+        self._coverage: dict[int, int] = {}
+        self._edges: dict[int, dict[int, int]] = {}
+        self._cov_handle = None
+        self._cov_limit = 200_000
+        self._cov_overflow = 0
+        self._steps = 0
         self._map_image()
+        self._install_fault_hook()
 
     # -- mapping -----------------------------------------------------------
     def _map_image(self) -> None:
@@ -199,6 +218,187 @@ class Emulator:
             out.append(byte)
         return out.decode("utf-8", "replace")
 
+    # -- faults ------------------------------------------------------------
+    def _install_fault_hook(self) -> None:
+        """Record the *first* bad access instead of surfacing a bare UcError.
+
+        When emulating real code the interesting failure is almost always "it
+        dereferenced a pointer that was not mapped here" — a heap object that was
+        never captured, or an uninitialised field.  Unicorn raises ``UC_ERR_READ_UNMAPPED``
+        and the call stack in the message is useless; this hook turns it into
+        ``{rip, access, address}``, which is a concrete thing to go and snapshot.
+        """
+        mod = self._uc_mod
+
+        def on_unmapped(uc, access, address, size, value, user):
+            self._faults.append({
+                "kind": "unmapped",
+                "access": _ACCESS_NAMES.get(access, str(access)),
+                "address": hex(address),
+                "size": size,
+                "value": hex(value) if isinstance(value, int) and value else None,
+                "rip": hex(uc.reg_read(self._reg_ids["rip"])),
+            })
+            uc.emu_stop()
+
+        def on_invalid(*args):
+            uc = args[0] if args else self.uc
+            try:
+                rip = hex(uc.reg_read(self._reg_ids["rip"]))
+            except Exception:
+                rip = None
+            self._faults.append({"kind": "invalid_instruction", "rip": rip})
+            uc.emu_stop()
+
+        try:
+            self.uc.hook_add(mod.UC_HOOK_MEM_UNMAPPED, on_unmapped)
+        except Exception:  # pragma: no cover - older unicorn builds
+            for name in ("UC_HOOK_MEM_READ_UNMAPPED", "UC_HOOK_MEM_WRITE_UNMAPPED"):
+                hook_type = getattr(mod, name, None)
+                if hook_type is not None:
+                    self.uc.hook_add(hook_type, on_unmapped)
+        hook_type = getattr(mod, "UC_HOOK_INSN_INVALID", None)
+        if hook_type is not None:
+            try:
+                self.uc.hook_add(hook_type, on_invalid)
+            except Exception:
+                pass
+
+    def faults(self, *, limit: int = 20) -> list[dict]:
+        """Bad accesses seen so far, oldest first."""
+        return self._faults[:limit]
+
+    # -- execution coverage ------------------------------------------------
+    def start_trace(self, *, max_addresses: int = 200_000) -> dict:
+        """Record every executed instruction and every taken edge.
+
+        A hook per instruction is expensive (a Python call per step), so this is
+        opt-in: enable it when the question is *which path did the code take*,
+        not when you are running a million-instruction function for a value.
+        """
+        if self._cov_handle is not None:
+            return {"tracing": True, "unique": len(self._coverage), "already": True}
+        self._cov_limit = max(1000, int(max_addresses))
+        mod = self._uc_mod
+
+        def hook(uc, addr, size, user):
+            self._steps += 1
+            hits = self._coverage.get(addr)
+            if hits is None:
+                if len(self._coverage) < self._cov_limit:
+                    self._coverage[addr] = 1
+                else:
+                    self._cov_overflow += 1
+            else:
+                self._coverage[addr] = hits + 1
+            previous = self._last_rip
+            if previous is not None:
+                successors = self._edges.get(previous)
+                if successors is None:
+                    self._edges[previous] = {addr: 1}
+                else:
+                    successors[addr] = successors.get(addr, 0) + 1
+            self._last_rip = addr
+
+        self._cov_handle = self.uc.hook_add(mod.UC_HOOK_CODE, hook)
+        self._last_rip = None
+        return {"tracing": True, "max_addresses": self._cov_limit}
+
+    def stop_trace(self) -> dict:
+        if self._cov_handle is not None:
+            try:
+                self.uc.hook_del(self._cov_handle)
+            except Exception:
+                pass
+            self._cov_handle = None
+        return {"tracing": False, "unique": len(self._coverage), "steps": self._steps}
+
+    def reset_trace(self) -> dict:
+        self._coverage.clear()
+        self._edges.clear()
+        self._steps = 0
+        self._cov_overflow = 0
+        self._last_rip = None
+        return {"reset": True, "tracing": self._cov_handle is not None}
+
+    def close(self) -> dict:
+        """Release the unicorn engine and every hook it holds.
+
+        Unicorn keeps a native engine per instance; dropping the Python object
+        defers that release to the cyclic collector, which can then run inside a
+        later ``mem_map`` and fault there.  Closing deterministically — before
+        creating the next emulator — keeps long analysis sessions stable.
+        """
+        self.stop_trace()
+        try:
+            self.uc.emu_stop()
+        except Exception:
+            pass
+        self._coverage.clear()
+        self._edges.clear()
+        self._hooks.clear()
+        self._watchpoints.clear()
+        self._faults.clear()
+        self._import_calls.clear()
+        self._closed = True
+        return {"closed": True}
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def __enter__(self) -> "Emulator":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def coverage(self, *, hot: int = 20 ) -> dict:
+        """What actually ran: unique instructions, hot spots and branch forks.
+
+        ``forks`` are addresses with more than one successor, which is exactly the
+        set of branch decisions the run took.  That is the cheap answer to "did
+        the check pass", "does it take the decrypt path", "which switch case ran".
+        """
+        forks = []
+        for address, successors in self._edges.items():
+            if len(successors) < 2:
+                continue
+            forks.append({
+                "va": hex(address),
+                "hits": sum(successors.values()),
+                "successors": [
+                    {"va": hex(target), "hits": hits}
+                    for target, hits in sorted(successors.items(), key=lambda item: -item[1])
+                ],
+            })
+        top = sorted(self._coverage.items(), key=lambda item: -item[1])[:hot]
+        executed = sorted(self._coverage)
+        return {
+            "tracing": self._cov_handle is not None,
+            "steps": self._steps,
+            "unique_instructions": len(self._coverage),
+            "edges": sum(len(successors) for successors in self._edges.values()),
+            "truncated": self._cov_overflow > 0,
+            "overflow_visits": self._cov_overflow,
+            "executed": [hex(va) for va in executed[:4096]],
+            "executed_truncated": len(executed) > 4096,
+            "hot": [{"va": hex(va), "hits": hits} for va, hits in top],
+            "forks": forks[:hot * 4],
+        }
+
+    def reached(self, addresses: Iterable[int]) -> dict:
+        """Split a list of addresses into those executed and those not.
+
+        The everyday use is "which of these handlers was hit", or confirming that
+        a decryption routine was never reached with the arguments you supplied.
+        """
+        wanted = [int(address) for address in addresses]
+        hit = [hex(address) for address in wanted if address in self._coverage]
+        missed = [hex(address) for address in wanted if address not in self._coverage]
+        return {"tracing": self._cov_handle is not None, "reached": hit, "not_reached": missed,
+                "count_reached": len(hit), "count_missed": len(missed)}
+
     # -- control -----------------------------------------------------------
     def step(self, count: int = 1) -> dict:
         start = self.read_regs(["rip"])["rip"]
@@ -217,6 +417,7 @@ class Emulator:
         """
         hit = {"value": False}
         handle = None
+        faults_before = len(self._faults)
         if stop_at is not None:
             def hook(uc, addr, size, user):
                 hit["value"] = True
@@ -236,6 +437,14 @@ class Emulator:
                     self.uc.hook_del(handle)
                 except Exception:
                     pass
+        # A fault hook stops the run cleanly, so a fault would otherwise be
+        # reported as "budget_exhausted".  Name it instead.
+        if len(self._faults) > faults_before:
+            fault = self._faults[-1]
+            if fault.get("kind") == "unmapped":
+                reason = f"fault: unmapped {fault['access']} at {fault['address']} (rip {fault['rip']})"
+            else:
+                reason = f"fault: {fault.get('kind')} (rip {fault.get('rip')})"
         return reason, hit["value"]
 
     def run_until(self, address: int, *, max_steps: int = 200_000, timeout_us: int = 0) -> dict:
@@ -314,6 +523,135 @@ class Emulator:
     def hooks(self) -> list[dict]:
         return list(self._hooks)
 
+    # -- import stubs ------------------------------------------------------
+    def install_import_stubs(self, *, returns: dict[str, int] | None = None,
+                             default: int = 0, log: bool = True) -> dict:
+        """Make calls to imported functions return instead of faulting.
+
+        A snapshot contains the image, not the module the image was linked
+        against: its code is the target's, so ``call qword ptr [rip+iat]`` lands
+        on an address that is not mapped here.  Overwriting the *IAT slot* with
+        the address of a generated ``mov eax, imm; ret`` stub turns that fault
+        into a normal return, and the code under analysis keeps running.
+
+        ``returns`` keys are ``module!name``, bare ``name`` or an IAT slot
+        address (hex string or int); unlisted imports return ``default``.  Every
+        hit is recorded for :meth:`import_calls` with the argument registers.
+        """
+        image = self.snapshot.image
+        slots = {
+            int(imp.iat_va): f"{imp.module}!{imp.name or '#' + str(imp.ordinal)}"
+            for imp in image.imports
+            if imp.iat_va
+        }
+        if not slots:
+            return {"installed": 0, "reason": "image has no import table"}
+
+        wanted = dict(returns or {})
+        page, per_slot = self._stub_page(), 0x20
+        page_size = ((len(slots) * per_slot) + 0xFFF) & ~0xFFF
+        try:
+            self.uc.mem_map(page, page_size, self._uc_mod.UC_PROT_ALL)
+        except Exception:
+            pass  # a second call reuses the page
+        self._stub_page_base = page
+        self._stub_slots: dict[int, dict] = {}
+
+        index = 0
+        for slot, api in slots.items():
+            stub = page + index * per_slot
+            index += 1
+            value = self._stub_return_value(api, slot, wanted, default)
+            self._write_stub(stub, value)
+            self._stub_slots[stub] = {"api": api, "slot": slot, "returns": value}
+            self.write(slot, stub.to_bytes(8 if self.bits == 64 else 4, "little", signed=False))
+
+        if log and self._stub_slots:
+            lower = min(self._stub_slots)
+            upper = max(self._stub_slots) + per_slot - 1
+
+            def hook(uc, addr, size, user):
+                # Only the stub's first instruction counts: the `ret` that follows
+                # it is inside the same page range and must not log twice.
+                entry = self._stub_slots.get(addr)
+                if entry is not None:
+                    args = self._stub_args()
+                    self._import_calls.append({
+                        "api": entry["api"],
+                        "slot": hex(entry["slot"]),
+                        "returns": hex(entry["returns"]),
+                        "args": [hex(arg) for arg in args],
+                    })
+
+            self._stub_hook = self.uc.hook_add(self._uc_mod.UC_HOOK_CODE, hook,
+                                               begin=lower, end=upper)
+
+        return {
+            "installed": len(self._stub_slots),
+            "page": hex(page),
+            "default_return": hex(default),
+            "stubs": [
+                {"api": info["api"], "slot": hex(info["slot"]), "stub": hex(stub),
+                 "returns": hex(info["returns"])}
+                for stub, info in sorted(self._stub_slots.items())
+            ],
+        }
+
+    def _stub_return_value(self, api: str, slot: int, wanted: dict, default: int) -> int:
+        short = api.split("!", 1)[-1]
+        keys = (api, short, hex(slot), str(slot))
+        for key in keys:
+            if key in wanted:
+                try:
+                    return int(wanted[key]) & 0xFFFFFFFFFFFFFFFF
+                except (TypeError, ValueError):
+                    continue
+        for key, value in wanted.items():
+            try:
+                if int(key, 0) == slot:
+                    return int(value) & 0xFFFFFFFFFFFFFFFF
+            except (TypeError, ValueError):
+                continue
+        return int(default) & 0xFFFFFFFFFFFFFFFF
+
+    def _write_stub(self, address: int, value: int) -> None:
+        if self.bits == 64:
+            if value <= 0xFFFFFFFF:
+                code = b"\xb8" + int(value).to_bytes(4, "little") + b"\xc3"
+            else:
+                code = b"\x48\xb8" + int(value).to_bytes(8, "little") + b"\xc3"
+        else:
+            code = b"\xb8" + (int(value) & 0xFFFFFFFF).to_bytes(4, "little") + b"\xc3"
+        self.write(address, code + b"\xcc" * (0x20 - len(code)))
+
+    def _stub_args(self) -> list[int]:
+        names = ("rcx", "rdx", "r8", "r9") if self.bits == 64 else ()
+        if not names:
+            return []
+        values = self.read_regs(list(names))
+        return [values[name] for name in names]
+
+    def _stub_page(self) -> int:
+        candidates = ((0x6000_0000_0000, 0x6100_0000_0000, 0x6200_0000_0000)
+                      if self.bits == 64 else (0x6000_0000, 0x6100_0000, 0x6200_0000))
+        occupied = [(self.snapshot.image.base, self.snapshot.image.size)]
+        occupied += [(start, max(size, len(data))) for start, size, _p, data in self.snapshot.extra_regions]
+        for base in candidates:
+            if not any(start <= base < start + max(size, 0x1000) for start, size in occupied):
+                return base
+        raise InvalidArgument("no free page for the import stubs")
+
+    def import_calls(self, *, limit: int = 200) -> list[dict]:
+        """Recorded import-stub hits, oldest first."""
+        return self._import_calls[:limit]
+
+    def stubs(self) -> list[dict]:
+        return [
+            {"api": info["api"], "slot": hex(info["slot"]), "stub": hex(stub),
+             "returns": hex(info["returns"])}
+            for stub, info in sorted(getattr(self, "_stub_slots", {}).items())
+        ]
+
     # -- convenience -------------------------------------------------------
     def _trap_page(self) -> int:
         """A mapped, never-executed page used as the return address."""
@@ -369,6 +707,8 @@ class Emulator:
         if returned:
             result["reason"] = "returned"
             result["return_address"] = hex(trap)
+        elif self._faults:
+            result["fault"] = self._faults[-1]
         return {"retval": hex(self.read_regs(["rax"])["rax"]), **result}
 
     def dump_stack(self, length: int = 0x80) -> list[str]:
@@ -379,8 +719,16 @@ class Emulator:
 
 def emulator_for(image: PEImage, *, regs: dict[str, int] | None = None,
                  stack: bytes | None = None, stack_base: int | None = None,
-                 extra_regions: list[tuple[int, int, str, bytes]] | None = None) -> Emulator:
-    """Create an :class:`Emulator` for a loaded image."""
+                 extra_regions: list[tuple[int, int, str, bytes]] | None = None,
+                 stack_size: int = 0x10000, auto_stubs: bool = False,
+                 trace: bool = False) -> Emulator:
+    """Create an :class:`Emulator` for a loaded image.
+
+    ``auto_stubs`` installs an import stub for every IAT slot up front (see
+    :meth:`Emulator.install_import_stubs`), which is what makes calling a real
+    function that talks to the OS return instead of faulting.  ``trace`` starts
+    instruction/edge recording immediately (see :meth:`Emulator.start_trace`).
+    """
     snapshot = EmuSnapshot(
         image=image,
         regs=dict(regs or {}),
@@ -388,7 +736,12 @@ def emulator_for(image: PEImage, *, regs: dict[str, int] | None = None,
         stack_base=stack_base,
         extra_regions=list(extra_regions or []),
     )
-    return Emulator(snapshot)
+    emulator = Emulator(snapshot, stack_size=int(stack_size))
+    if auto_stubs:
+        emulator.install_import_stubs()
+    if trace:
+        emulator.start_trace()
+    return emulator
 
 
 def emulator_available() -> bool:

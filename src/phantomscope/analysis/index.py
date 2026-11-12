@@ -394,3 +394,13 @@ class IndexCache:
 
     def clear(self) -> None:
         self._cache.clear()
+
+    def invalidate(self, image: PEImage) -> None:
+        """Forget the index for one image, after its bytes changed.
+
+        A cached index describes the bytes it was built from.  Patching a function
+        without dropping its index means ``decompile`` and ``disassemble`` keep
+        reporting the pre-patch instructions, which is exactly the kind of silent
+        staleness that makes a patch look like it did not apply.
+        """
+        self._cache.pop((id(image), image.base), None)

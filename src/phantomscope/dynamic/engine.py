@@ -10,6 +10,10 @@ about the ones that are not:
 * AOB scanning inside a live process,
 * pointer-chain resolution from a static base to a heap address,
 * snapshots and diffs (the "cheat table"-style workflow),
+* live structure recovery: object dumps, stride arrays, field inference and
+  ``std::vector`` / ``TArray`` expansion (:mod:`.structures`),
+* write tracing by sampling, the substitute for memory breakpoints (:mod:`.trace`),
+* pointer paths you can replay: scan → resolve → read the field (:mod:`.pointer`),
 
 Snapshot emulation (register context, single stepping) lives in
 :mod:`phantomscope.dynamic.emulator` and is optional.
@@ -36,15 +40,59 @@ from ..models import (
     ThreadInfo,
 )
 from ..analysis.scan import parse_pattern, scan_bytes
+from . import pointer as chains
+from . import structures, trace
 
 MAX_SCAN_BYTES = 512 * 1024 * 1024
 DEFAULT_SCAN_CHUNK = 4 * 1024 * 1024
+
+#: Bytes that continue a printable ASCII run (tab is common in config blobs).
+_PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09}
+
+
+def _iter_strings(data: bytes, unit: int, min_length: int):
+    """Yield printable runs from ``data``, one code unit at a time.
+
+    ``unit=2`` walks UTF-16LE and requires the high byte of every character to be
+    zero — that is what distinguishes a real wide string from the same bytes read
+    as garbage, and it is how every wide string on Windows is stored.
+
+    The wide walk tries *both* byte alignments.  A string is only aligned to two
+    relative to the allocation it was built in, and a heap buffer does not
+    generally start at an even offset inside the region we happened to read, so an
+    even-only walk silently misses roughly half of all wide strings.
+    """
+    length = len(data)
+    phases = (0,) if unit == 1 else (0, 1)
+    seen: set[int] = set()
+    for phase in phases:
+        index = phase
+        start = -1
+        while index + unit <= length:
+            low = data[index]
+            ok = low in _PRINTABLE and (unit == 1 or data[index + 1] == 0)
+            if ok:
+                if start < 0:
+                    start = index
+                index += unit
+                continue
+            if start >= 0 and (index - start) // unit >= min_length and start not in seen:
+                seen.add(start)
+                yield {"offset": start,
+                       "length": (index - start) // unit,
+                       "text": data[start:index:unit].decode("ascii", "replace")}
+            start = -1
+            index += unit
+        if start >= 0 and (length - start) // unit >= min_length and start not in seen:
+            seen.add(start)
+            yield {"offset": start,
+                   "length": (length - start) // unit,
+                   "text": data[start:length:unit].decode("ascii", "replace")}
 
 
 @dataclass
 class ScanState:
     """Persistent state for narrowing scans."""
-
     pid: int
     value_type: str
     addresses: list[int]
@@ -64,8 +112,10 @@ class DynamicEngine:
         self._patches: list[PatchRecord] = []
         self._snapshots: dict[int, Snapshot] = {}
         self._scans: dict[str, ScanState] = {}
+        self._module_snaps: dict[int, dict] = {}
         self._next_patch = 1
         self._next_snapshot = 1
+        self._next_module_snap = 1
 
     # -- helpers -----------------------------------------------------------
     def _read(self, pid: int, va: int, size: int) -> bytes:
@@ -156,6 +206,19 @@ class DynamicEngine:
             module = self.resolve_module(pid, module_name)
             return module.base + utils.parse_address(offset, name="offset")
         return utils.parse_address(text)
+
+    # -- public accessors for the analysis helpers -------------------------
+    # `structures`, `trace` and `pointer` need read/region/module lookups but not
+    # the rest of this class; these thin wrappers keep them out of the private
+    # attributes instead of copying the logic.
+    def read_bytes(self, pid: int, va: int, size: int) -> bytes:
+        return self._read(pid, va, size)
+
+    def regions(self, pid: int) -> list[Region]:
+        return self._regions(pid)
+
+    def module_for(self, pid: int, va: int) -> ModuleInfo | None:
+        return self._module_for(pid, va)
 
     # -- memory ------------------------------------------------------------
     def read(self, pid: int, va: int, size: int, *, dump: bool = False) -> dict:
@@ -266,17 +329,70 @@ class DynamicEngine:
     def _scan_targets(self, pid: int, *, region_filter: str | None = None,
                       readable_only: bool = True) -> list[Region]:
         regions = self._regions(pid)
+        needle = (region_filter or "").lower()
         out: list[Region] = []
         for region in regions:
             prot = region.protection.lower()
             if readable_only and "r" not in prot:
                 continue
-            if region_filter and region_filter.lower() not in (region.module or "").lower():
+            if needle and needle not in (region.module or "").lower() \
+                    and needle not in (region.tag or "").lower():
                 continue
             if region.size <= 0 or region.size > MAX_SCAN_BYTES:
                 continue
             out.append(region)
         return out
+
+    def scan_strings(self, pid: int, needle: str = "", *, min_length: int = 6,
+                     limit: int = 500, encoding: str = "ascii",
+                     region_filter: str | None = None,
+                     max_bytes: int = MAX_SCAN_BYTES) -> dict:
+        """Find readable strings in *live* memory, optionally containing ``needle``.
+
+        ``strings`` on the static engine only sees what is on disk.  Anything the
+        target builds at run time — a URL after a redirect, a decrypted key, a JSON
+        payload assembled in a heap buffer — exists only here.
+
+        ``encoding`` accepts ``ascii``, ``utf16`` or ``both``; ``utf16`` is worth
+        checking separately because Windows stores almost every user-visible string
+        that way, and an ASCII-only scan misses all of it.
+        """
+        wanted = needle.lower()
+        units: list[tuple[str, int]] = []
+        if encoding in ("ascii", "both"):
+            units.append(("ascii", 1))
+        if encoding in ("utf16", "both"):
+            units.append(("utf16", 2))
+        if not units:
+            raise InvalidArgument("encoding must be ascii, utf16 or both")
+
+        out: list[dict] = []
+        scanned = 0
+        regions = self._scan_targets(pid, region_filter=region_filter)
+        for region in regions:
+            if scanned >= max_bytes or len(out) >= limit:
+                break
+            try:
+                data = self._read(pid, region.base, region.size)
+            except Exception:
+                continue
+            scanned += len(data)
+            for kind, unit in units:
+                for hit in _iter_strings(data, unit, min_length):
+                    if wanted and wanted not in hit["text"].lower():
+                        continue
+                    hit.update({"va": hex(region.base + hit.pop("offset")),
+                                "encoding": kind})
+                    if region.module:
+                        hit["module"] = region.module
+                    out.append(hit)
+                    if len(out) >= limit:
+                        break
+                if len(out) >= limit:
+                    break
+        out.sort(key=lambda row: int(row["va"], 16))
+        return {"pid": pid, "count": len(out), "scanned_bytes": scanned,
+                "encoding": encoding, "matches": out}
 
     def scan_aob(self, pid: int, pattern: str, *, limit: int = 200,
                  region_filter: str | None = None, max_bytes: int = MAX_SCAN_BYTES) -> list[dict]:
@@ -336,29 +452,65 @@ class DynamicEngine:
                   changed: bool = False, unchanged: bool = False,
                   increased: bool = False, decreased: bool = False,
                   limit: int = 200_000) -> dict:
-        """Narrow an existing scan.  With no predicate, keep addresses whose
-        value still equals ``value``."""
+        """Narrow an existing scan.
+
+        ``value`` keeps addresses whose current value equals it.  ``increased`` /
+        ``decreased`` compare against each address's *own* previous value, which is
+        what makes them usable when you never knew the number in the first place —
+        the common case: the target drifts, so there is no single value to compare
+        a thousand candidates against.
+
+        ``unchanged`` keeps addresses that still hold what they held last pass,
+        which is how you drop the noise without knowing any of the values.
+        ``changed`` is the opposite and, like the two above, needs a baseline:
+        ``scan_next(changed=True)`` with no baseline captures one and returns
+        everything, so the natural loop is capture → let the target move → narrow.
+        """
         state = self._scans.get(key)
         if state is None:
             raise NotFound(f"unknown scan {key!r}")
         size = utils.value_type_size(state.value_type)
+        previous = getattr(state, "previous", None) or {}
+        if (increased or decreased or unchanged or changed) and not previous:
+            current_values = {}
+            for address in state.addresses:
+                try:
+                    current_values[address] = utils.unpack_value(
+                        self._read(state.pid, address, size), state.value_type
+                    )
+                except Exception:
+                    continue
+            state.previous = current_values  # type: ignore[attr-defined]
+            return {"key": key, "pid": state.pid, "type": state.value_type,
+                    "count": len(state.addresses),
+                    "addresses": [hex(a) for a in state.addresses[:200]],
+                    "baseline": True,
+                    "hint": "values captured; let the target change, then call again"}
         remaining: list[int] = []
+        current_values: dict[int, Any] = {}
         for address in state.addresses:
             try:
                 data = self._read(state.pid, address, size)
                 current = utils.unpack_value(data, state.value_type)
             except Exception:
                 continue
+            current_values[address] = current
             if value is not None and current != value:
                 continue
-            if increased and not current > value:
+            before = previous.get(address)
+            if increased and (before is None or not current > before):
                 continue
-            if decreased and not current < value:
+            if decreased and (before is None or not current < before):
+                continue
+            if unchanged and before is not None and current != before:
+                continue
+            if changed and before is not None and current == before:
                 continue
             remaining.append(address)
             if len(remaining) >= limit:
                 break
         state.addresses = remaining
+        state.previous = current_values  # type: ignore[attr-defined]
         return {"key": key, "pid": state.pid, "type": state.value_type,
                 "count": len(remaining), "addresses": [hex(a) for a in remaining[:200]]}
 
@@ -462,23 +614,28 @@ class DynamicEngine:
 
         if not by_depth:
             return []
-        leaf_depth = len(by_depth) - 1
+        # ``by_depth[0]`` holds slots that point at the target, ``by_depth[1]``
+        # holds slots that point at *those* slots, and so on.  A chain therefore
+        # starts at the deepest level and reads forward: the outermost slot, then
+        # each slot it pointed at, ending at the target.  Building it by walking
+        # backwards from every leaf costs a read per candidate per level and, worse,
+        # silently produced nothing whenever a level had more than a handful of
+        # candidates — the reverse link was never the thing being searched for.
         chains: list[dict] = []
-        for depth_index in range(leaf_depth, -1, -1):
+        for depth_index in range(len(by_depth) - 1, -1, -1):
             for region, slot in by_depth[depth_index][: max(1, limit)]:
-                # Walk backwards: which slot at the previous depth points here?
                 path = [(region, slot)]
                 cursor = slot
                 walked = True
                 for level in range(depth_index - 1, -1, -1):
-                    parent = None
-                    for parent_region, parent_slot in by_depth[level]:
-                        try:
-                            if self._read(pid, parent_slot, 8) == struct.pack("<Q", cursor):
-                                parent = (parent_region, parent_slot)
-                                break
-                        except Exception:
-                            continue
+                    try:
+                        nxt = struct.unpack("<Q", self._read(pid, cursor, 8))[0]
+                    except Exception:
+                        walked = False
+                        break
+                    parent = next(
+                        (item for item in by_depth[level] if item[1] == nxt), None
+                    )
                     if parent is None:
                         walked = False
                         break
@@ -486,7 +643,8 @@ class DynamicEngine:
                     cursor = parent[1]
                 if not walked:
                     continue
-                path.reverse()
+                # No reversal: ``path[0]`` is the slot from the *deepest* level,
+                # i.e. the outermost one, which is where a chain has to start.
                 chain = [
                     {
                         "region": item_region.module or item_region.tag or hex(item_region.base),
@@ -592,6 +750,155 @@ class DynamicEngine:
                 }
             )
         return changes
+
+    # -- pointer paths -----------------------------------------------------
+    def resolve_pointer_chain(self, pid: int, base: str | int, offsets: list,
+                              *, value_type: str | None = None,
+                              read_size: int = 0) -> dict:
+        """Walk a pointer path (``module+0x10``, ``[0x10, 0x38, 0x8]``) and read the field.
+
+        See :mod:`phantomscope.dynamic.pointer` for the two offset conventions: a
+        hand-written chain adds every offset, a chain from ``pointer_scan`` is
+        replayed with :meth:`replay_pointer_chains`.
+        """
+        return chains.resolve(self, pid, base, offsets, value_type=value_type,
+                              read_size=read_size)
+
+    def replay_pointer_chains(self, pid: int, candidates: list[dict], *,
+                              value_type: str | None = None, limit: int = 10) -> list[dict]:
+        """Re-run chains from ``pointer_scan`` and report which still resolve."""
+        return chains.resolve_many(self, pid, candidates, value_type=value_type, limit=limit)
+
+    # -- live structures ---------------------------------------------------
+    def read_object(self, pid: int, va: int, size: int = 0x80, *,
+                    fields: str | dict | None = None) -> dict:
+        """One object: hexdump, qwords with pointer validity, typed fields."""
+        return structures.read_object(self, pid, va, size, fields=fields)
+
+    def read_array(self, pid: int, base: int, stride: int, count: int, *,
+                   fields: str | dict | None = None, follow: bool = False,
+                   object_size: int = 0x40, limit: int = 128) -> dict:
+        """``count`` objects at ``stride`` bytes, or an array of pointers when ``follow``."""
+        return structures.read_array(self, pid, base, stride, count, fields=fields,
+                                     follow=follow, object_size=object_size, limit=limit)
+
+    def infer_struct(self, pid: int, va: int, size: int = 0x40, *,
+                     stride: int | None = None, count: int = 1,
+                     align: int = 8) -> dict:
+        """Infer field layout from sampled values, and print a C declaration."""
+        return structures.infer_struct(self, pid, va, size, stride=stride,
+                                       count=count, align=align)
+
+    def detect_container(self, pid: int, va: int, *,
+                         element_size: int | None = None) -> dict:
+        """Which container layout fits the bytes at ``va`` (vector / TArray / string)."""
+        return structures.detect_container(self, pid, va, element_size=element_size)
+
+    def expand_container(self, pid: int, va: int, *, element_size: int | None = None,
+                         fields: str | dict | None = None, limit: int = 64) -> dict:
+        """Detect a container and read its elements in one call.
+
+        This is the entity-list workflow: point it at a manager object and get the
+        elements back, with the layout guess and its evidence attached.
+        """
+        detected = structures.detect_container(self, pid, va, element_size=element_size)
+        primary = detected.get("primary")
+        if primary is None:
+            detected["elements"] = []
+            detected["note"] = "no container layout fits these bytes; try read_object"
+            return detected
+        if "(SSO" in primary["kind"] or "(heap)" in primary["kind"]:
+            detected["elements"] = []
+            detected["value"] = primary.get("value")
+            return detected
+
+        size = primary.get("element_size") or (primary.get("element_size_candidates") or [8])[0]
+        count = primary.get("count") or 0
+        if not count:
+            detected["elements"] = []
+            detected["note"] = "container is empty (count 0)"
+            return detected
+        data_va = int(str(primary["data_va"]), 16)
+        detected["elements"] = structures.read_array(
+            self, pid, data_va, int(size), int(count), fields=fields, limit=limit
+        )["objects"]
+        detected["element_size"] = size
+        detected["element_count"] = min(int(count), limit)
+        return detected
+
+    # -- change tracing ----------------------------------------------------
+    def trace_changes(self, pid: int, base: int, size: int, *, samples: int = 8,
+                      interval: float = 0.02, limit: int = 64) -> dict:
+        """Poll a range and report what changed, how often, and as what type."""
+        return trace.trace_changes(self, pid, base, size, samples=samples,
+                                   interval=interval, limit=limit)
+
+    def trace_value(self, pid: int, va: int, value_type: str, *, samples: int = 8,
+                    interval: float = 0.02) -> dict:
+        """Time series for one typed value (counters, timers, health bars)."""
+        return trace.trace_value(self, pid, va, value_type, samples=samples,
+                                 interval=interval)
+
+    def sample_matrix(self, pid: int, va: int, width: int = 8, rows: int = 16,
+                      stride: int = 8, *, interval: float = 0.02) -> dict:
+        """A grid of typed cells read twice — a quick "is this an object" view."""
+        return trace.sample_matrix(self, pid, va, width, rows, stride, interval=interval)
+
+    # -- module snapshots --------------------------------------------------
+    def snapshot_module(self, pid: int, name: str, *, label: str | None = None) -> dict:
+        """Snapshot every mapped region of a module.
+
+        Whole-module snapshots are what make ``diff_module`` useful: static data
+        (a decrypted config, an unlocked table) changes in place, and a region
+        snapshot taken before the trigger is the only baseline that proves it.
+        """
+        module = self.resolve_module(pid, name)
+        regions = [r for r in self._regions(pid) if module.base <= r.base < module.end]
+        if not regions:
+            raise NotFound(f"no mapped regions for module {module.name!r}")
+        entries = []
+        for region in regions:
+            if region.size <= 0:
+                continue
+            record = self.snapshot(pid, region.base, region.size)
+            entries.append({"snapshot_id": record["id"], "base": hex(region.base),
+                            "size": region.size, "protection": region.protection})
+        entry = {"id": self._next_module_snap, "pid": pid, "module": module.name,
+                 "base": hex(module.base), "label": label, "created": time.time(),
+                 "regions": entries}
+        self._next_module_snap += 1
+        self._module_snaps[entry["id"]] = entry
+        return entry
+
+    def diff_module(self, pid: int, name: str, *, snapshot_id: int | None = None,
+                    limit: int = 200) -> dict:
+        """Compare a module's regions against a ``snapshot_module`` baseline."""
+        module = self.resolve_module(pid, name)
+        candidates = [item for item in self._module_snaps.values()
+                      if item["pid"] == pid and item["module"].lower() == module.name.lower()
+                      and (snapshot_id is None or item["id"] == snapshot_id)]
+        if not candidates:
+            raise NotFound(f"no module snapshot for {module.name!r}; call snapshot_module first")
+        baseline = candidates[-1]
+        changes: list[dict] = []
+        for region in baseline["regions"]:
+            snap = self._snapshots.get(int(region["snapshot_id"]))
+            if snap is None:
+                continue
+            try:
+                current = self._read(pid, snap.record.base, snap.record.size)
+            except BackendError:
+                continue
+            for change in self._diff_bytes(snap.record.base, snap.data, current,
+                                           limit - len(changes)):
+                change["region"] = region["base"]
+                changes.append(change)
+            if len(changes) >= limit:
+                break
+        return {"pid": pid, "module": module.name, "snapshot_id": baseline["id"],
+                "label": baseline.get("label"), "regions_compared": len(baseline["regions"]),
+                "changed_bytes": sum(len(bytes.fromhex(c["new"])) for c in changes),
+                "changes": changes, "truncated": len(changes) >= limit}
 
     # -- convenience -------------------------------------------------------
     def module_bytes(self, pid: int, name: str) -> bytes:

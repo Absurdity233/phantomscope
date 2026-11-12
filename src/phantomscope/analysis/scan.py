@@ -85,10 +85,13 @@ def scan_bytes(data: bytes, tokens: "str | bytes | list[int | None]", *, base: i
                limit: int = 1000, alignment: int = 1) -> list[int]:
     """Return absolute addresses of every match in ``data``.
 
-    ``tokens`` may be a pattern string, raw bytes, or parsed tokens.
+    ``tokens`` may be a pattern string (``"48 8b ??"``), raw bytes (matched
+    literally) or parsed tokens.
     """
-    if isinstance(tokens, (str, bytes)):
+    if isinstance(tokens, str):
         tokens = parse_pattern(tokens)
+    elif isinstance(tokens, (bytes, bytearray)):
+        tokens = list(tokens)
     n = len(tokens)
     if n == 0 or len(data) < n:
         return []

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import os
+import pathlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -122,6 +123,9 @@ class PEImage:
     exports: list[ExportInfo] = field(default_factory=list)
     imported_by_slot: dict[int, str] = field(default_factory=dict)
     mapped: bool = True
+    #: Annotations published by :class:`~phantomscope.analysis.annotations.AnnotationStore`.
+    user_names: dict[int, str] = field(default_factory=dict)
+    user_comments: dict[int, str] = field(default_factory=dict)
 
     # -- geometry ----------------------------------------------------------
     @property
@@ -163,6 +167,38 @@ class PEImage:
         if rva < 0 or rva >= len(self.image):
             return b""
         return bytes(self.image[rva : rva + size])
+
+    def file_image(self) -> bytes:
+        """Lay the mapped image out as a raw file image, ready for IDA or pefile.
+
+        A module captured over DMA (or a memory dump of a packed section) is
+        RVA-indexed: section *virtual* addresses are where the bytes live, and the
+        on-disk raw layout described by the headers is often wrong or was never
+        produced at all.  Writing that buffer straight to disk gives a file every
+        tool refuses to open, because ``PointerToRawData`` no longer matches where
+        the bytes actually are.
+
+        This demaps it: headers stay, each section is copied from its virtual
+        address to its declared raw offset.  The result loads in IDA/Ghidra and in
+        pefile, which is the whole point of dumping a module.
+        """
+        return _demap(bytes(self.image))
+
+    def save(self, path: str, *, raw: bool = False) -> dict:
+        """Write the image to ``path``; ``raw=True`` keeps the RVA layout as-is."""
+        payload = self.image if raw else self.file_image()
+        target = pathlib.Path(path)
+        if target.parent and not target.parent.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(bytes(payload))
+        return {
+            "path": str(target),
+            "layout": "rva" if raw else "file",
+            "size": len(payload),
+            "base": hex(self.base),
+            "entry_rva": hex(self.entry_rva),
+            "sections": [section.name for section in self.sections],
+        }
 
     def section_for_va(self, va: int) -> SectionInfo | None:
         for section in self.sections:
@@ -297,6 +333,31 @@ class PEImage:
         """Map an IAT slot VA to ``module!name``."""
         return self.imported_by_slot.get(va) or self.imported_by_slot.get(va - self.base)
 
+    def user_name(self, va: int) -> str | None:
+        """Name given by the analyst (see ``rename_function``)."""
+        return self.user_names.get(va)
+
+    def label(self, va: int) -> str | None:
+        """Short display label for an address inside this image.
+
+        Order of preference: analyst annotation, export, ``module!import`` for an
+        IAT slot, then ``section+offset``.  Used by the disassembler and the
+        pseudo-C recovery so both agree on what a target is called.
+        """
+        name = self.user_names.get(va)
+        if name:
+            return name
+        for export in self.exports:
+            if export.va == va and export.name:
+                return export.name
+        import_name = self.resolve_import_name(va)
+        if import_name:
+            return import_name
+        section = self.section_for_va(va)
+        if section is not None:
+            return f"{section.name}+{va - section.va:#x}"
+        return None
+
     def rebase(self, new_base: int) -> None:
         """Change the reported image base (e.g. after ASLR) without touching RVAs."""
         delta = new_base - self.base
@@ -344,11 +405,18 @@ def _collect_imports(pe: pefile.PE, base: int) -> tuple[list[ImportInfo], dict[i
         directory = pe.DIRECTORY_ENTRY_IMPORT
     except AttributeError:
         return imports, by_slot
+    # pefile reports an import slot as a *VA* (ImageBase + RVA) but an export as
+    # a bare RVA, so the two collectors normalise differently on purpose.
+    image_base = _as_int(getattr(pe.OPTIONAL_HEADER, "ImageBase", 0))
     for entry in directory:
         module = (entry.dll or b"").decode("ascii", "replace")
         for symbol in entry.imports:
             name = symbol.name.decode("ascii", "replace") if symbol.name else None
-            iat_va = (base + int(symbol.address)) if symbol.address else None
+            raw = _as_int(symbol.address, 0)
+            iat_va = None
+            if raw:
+                rva = raw - image_base if raw >= image_base else raw
+                iat_va = base + rva
             imports.append(
                 ImportInfo(
                     module=module,

@@ -51,6 +51,20 @@ async def main() -> int:
             emu = await call("emu_create", key="demo")
             print("emu_create:", emu["entry"])
 
+            # The dynamic-analysis surface, over a real stdio round trip.
+            chain = await call("resolve_pointer_chain", base=hex(0x21A_0000_01E0),
+                               offsets="0,8", value_type="uint32")
+            print("chain:", chain["address"], "=", chain["value"])
+
+            vector = await call("expand_container", va=hex(0x21A_0000_0180),
+                                fields="0x0:int32,0x8:char[8]")
+            print("container:", vector["primary"]["kind"],
+                  vector["primary"]["element_size"], "x", vector["element_count"])
+
+            series = await call("trace_value", va=hex(0x21A_0000_0120),
+                                value_type="int32", samples=2, interval=0.0)
+            print("trace_value:", "constant" if series["constant"] else "changing")
+
             await call("session_close")
     return 0
 

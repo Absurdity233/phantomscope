@@ -128,6 +128,9 @@ class Disassembler:
                 label = self._label(target, image)
                 if label and (not comment or comment != label):
                     comment = f"{comment}; {label}" if comment else label
+            note = image.user_comments.get(int(insn.address))
+            if note:
+                comment = f"{comment}; {note}" if comment else note
         return Instruction(
             va=int(insn.address),
             bytes=bytes(insn.bytes).hex(" "),
@@ -143,17 +146,8 @@ class Disassembler:
 
     @staticmethod
     def _label(value: int, image: PEImage) -> str | None:
-        import_name = image.resolve_import_name(value)
-        if import_name:
-            return import_name
-        for export in image.exports:
-            if export.va == value and export.name:
-                return export.name
-        if image.contains(value):
-            section = image.section_for_va(value)
-            if section is not None:
-                return f"{section.name}+{value - section.va:#x}"
-        return None
+        """Display label for a reference, honouring analyst annotations."""
+        return image.label(value)
 
     # -- ranges ------------------------------------------------------------
     def disassemble(self, code: bytes, va: int, image: PEImage | None = None,
